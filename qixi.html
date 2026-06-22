@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>千里共婵娟 · 七夕</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Ma+Shan+Zheng&family=Noto+Serif+SC:wght@300;500;700&family=ZCOOL+XiaoWei&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#070b1f;
+    --ink-2:#121434;
+    --ink-3:#241a45;
+    --moon:#fff7e2;
+    --moon-glow:#ffe6a8;
+    --gold:#e9c987;
+    --rose:#ff8fa3;
+    --jade:#9fd8c8;
+    --paper:#f4ecd8;
+    --serif:"Noto Serif SC",serif;
+    --kai:"Ma Shan Zheng",cursive;
+    --xi:"ZCOOL XiaoWei",serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;width:100%;overflow:hidden;background:#05070f;color:var(--paper);font-family:var(--serif);}
+  body{
+    position:relative;
+    background:
+      radial-gradient(120% 90% at 78% 18%, #2a2150 0%, transparent 55%),
+      radial-gradient(140% 120% at 20% 85%, #1b1740 0%, transparent 60%),
+      linear-gradient(180deg,#0a0d24 0%, #121535 45%, #1a163f 75%, #221640 100%);
+  }
+  /* ---------- 星空 canvas ---------- */
+  #sky{position:fixed;inset:0;z-index:1;display:block;}
+  /* ---------- 银河 ---------- */
+  .galaxy{
+    position:fixed;z-index:2;inset:-10% -20%;
+    background:
+      radial-gradient(40% 30% at 60% 40%, rgba(160,150,255,.16), transparent 70%),
+      radial-gradient(30% 24% at 45% 55%, rgba(255,180,220,.12), transparent 70%);
+    transform:rotate(-22deg);
+    filter:blur(6px);
+    opacity:.85;
+    mix-blend-mode:screen;
+    pointer-events:none;
+    animation:galaxyDrift 40s ease-in-out infinite alternate;
+  }
+  @keyframes galaxyDrift{
+    0%{transform:rotate(-22deg) translate(0,0)}
+    100%{transform:rotate(-20deg) translate(-2%,1%)}
+  }
+  /* ---------- 月亮 ---------- */
+  .moon-wrap{
+    position:fixed;z-index:3;top:9%;right:12%;
+    width:clamp(120px,16vw,200px);height:clamp(120px,16vw,200px);
+    pointer-events:none;
+  }
+  .halo,.halo2{
+    position:absolute;inset:-60%;border-radius:50%;
+    background:radial-gradient(circle, rgba(255,231,168,.35) 0%, rgba(255,210,140,.12) 35%, transparent 65%);
+    animation:breathe 6s ease-in-out infinite;
+  }
+  .halo2{inset:-110%;background:radial-gradient(circle, rgba(255,220,150,.18) 0%, transparent 60%);animation-duration:9s;animation-delay:-2s;}
+  @keyframes breathe{0%,100%{transform:scale(1);opacity:.85}50%{transform:scale(1.08);opacity:1}}
+  .moon{
+    position:absolute;inset:0;border-radius:50%;
+    background:
+      radial-gradient(circle at 36% 32%, #fffdf4 0%, #fff3d2 38%, #f3dca0 72%, #e6c884 100%);
+    box-shadow:
+      0 0 40px rgba(255,233,170,.55),
+      0 0 90px rgba(255,225,150,.35),
+      inset -16px -18px 40px rgba(180,150,90,.35);
+  }
+  .moon::before,.moon::after{
+    content:"";position:absolute;border-radius:50%;background:rgba(200,175,120,.22);
+  }
+  .moon::before{width:26%;height:26%;top:24%;left:30%;}
+  .moon::after{width:16%;height:16%;top:58%;left:54%;background:rgba(190,165,110,.18)}
+
+  /* ---------- 远山 ---------- */
+  .mountains{position:fixed;left:0;right:0;bottom:0;z-index:4;pointer-events:none;}
+  .mountains svg{display:block;width:100%;height:auto;}
+  /* ---------- 鹊桥塔 ---------- */
+  .tower{
+    position:fixed;left:6%;bottom:0;z-index:5;height:42vh;pointer-events:none;
+    filter:drop-shadow(0 0 18px rgba(255,200,120,.15));
+    opacity:.92;
+  }
+
+  /* ---------- 主内容 ---------- */
+  .stage{position:relative;z-index:10;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:6vh 6vw;text-align:center;}
+  .title{
+    font-family:var(--kai);
+    font-size:clamp(38px,8vw,86px);
+    letter-spacing:.14em;
+    color:#fff6df;
+    text-shadow:0 0 18px rgba(255,220,150,.55), 0 0 40px rgba(255,180,120,.3);
+    margin-bottom:.3em;
+  }
+  .title .ch{display:inline-block;opacity:0;transform:translateY(20px) rotateX(40deg);animation:rise .9s forwards;}
+  .title .ch:nth-child(1){animation-delay:.2s}
+  .title .ch:nth-child(2){animation-delay:.45s}
+  .title .ch:nth-child(3){animation-delay:.7s}
+  .title .ch:nth-child(4){animation-delay:.95s}
+  .title .ch:nth-child(5){animation-delay:1.2s}
+  @keyframes rise{to{opacity:1;transform:translateY(0) rotateX(0)}}
+
+  .subtitle{
+    font-family:var(--xi);
+    font-size:clamp(14px,2.2vw,20px);
+    color:#cdbfe6;letter-spacing:.5em;text-indent:.5em;
+    opacity:0;animation:fade 1.2s 1.6s forwards;
+  }
+  .poem{
+    margin-top:3.4vh;max-width:640px;
+    font-family:var(--serif);font-weight:300;
+    font-size:clamp(15px,2.4vw,22px);line-height:2.4;
+    color:#e9e2ff;letter-spacing:.12em;
+    text-shadow:0 1px 12px rgba(80,70,140,.6);
+  }
+  .poem .ln{display:block;overflow:hidden}
+  .poem .ln>span{display:inline-block;transform:translateY(110%);opacity:0;animation:lineUp 1s forwards;}
+  .poem .ln:nth-child(1)>span{animation-delay:2.1s}
+  .poem .ln:nth-child(2)>span{animation-delay:2.5s}
+  .poem .ln:nth-child(3)>span{animation-delay:2.9s}
+  .poem .ln:nth-child(4)>span{animation-delay:3.3s}
+  @keyframes lineUp{to{transform:translateY(0);opacity:1}}
+  .poem .src{display:block;margin-top:1.2em;font-size:.7em;color:#9f93c4;letter-spacing:.3em;opacity:0;animation:fade 1s 3.8s forwards}
+
+  @keyframes fade{to{opacity:1}}
+
+  /* ---------- 祈愿 ---------- */
+  .wish-area{
+    position:fixed;z-index:20;left:50%;bottom:7%;transform:translateX(-50%);
+    display:flex;flex-direction:column;align-items:center;gap:10px;
+    opacity:0;animation:fade 1.2s 4.2s forwards;width:min(86vw,520px);
+  }
+  .wish-hint{font-family:var(--xi);font-size:13px;color:#b6a9da;letter-spacing:.3em;}
+  .wish-input{
+    display:flex;gap:8px;width:100%;
+    background:rgba(20,18,48,.45);backdrop-filter:blur(8px);
+    border:1px solid rgba(233,201,135,.3);border-radius:999px;padding:6px 6px 6px 18px;
+    box-shadow:0 8px 30px rgba(0,0,0,.4);
+  }
+  .wish-input input{
+    flex:1;background:transparent;border:none;outline:none;color:#fff;font-family:var(--serif);
+    font-size:15px;letter-spacing:.08em;
+  }
+  .wish-input input::placeholder{color:#8a7fae}
+  .wish-btn{
+    background:linear-gradient(135deg,#e9c987,#d98a6a);
+    color:#2a1430;border:none;cursor:pointer;
+    font-family:var(--kai);font-size:16px;letter-spacing:.1em;
+    padding:10px 22px;border-radius:999px;white-space:nowrap;
+    box-shadow:0 4px 16px rgba(217,138,106,.45);
+    transition:transform .15s ease, box-shadow .15s ease;
+  }
+  .wish-btn:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(217,138,106,.6)}
+  .wish-btn:active{transform:translateY(0)}
+
+  /* ---------- 花瓣 / 萤火 canvas ---------- */
+  #petals{position:fixed;inset:0;z-index:6;pointer-events:none;}
+  /* ---------- 灯笼层 ---------- */
+  #lanterns{position:fixed;inset:0;z-index:7;pointer-events:none;}
+
+  /* ---------- 提示气泡 ---------- */
+  .toast{
+    position:fixed;z-index:50;left:50%;top:18%;transform:translate(-50%,-20px);
+    background:rgba(20,18,48,.7);backdrop-filter:blur(10px);
+    border:1px solid rgba(233,201,135,.4);border-radius:14px;
+    padding:12px 22px;color:#ffe9c4;font-family:var(--xi);letter-spacing:.12em;
+    font-size:15px;opacity:0;pointer-events:none;transition:all .4s ease;
+  }
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+
+  .credit{position:fixed;z-index:20;right:14px;bottom:10px;font-size:11px;color:#5a527a;letter-spacing:.2em;font-family:var(--xi);}
+
+  @media (max-width:560px){
+    .tower{left:0;height:34vh;opacity:.8}
+    .moon-wrap{top:7%;right:8%}
+    .poem{margin-top:2.4vh}
+    .wish-area{bottom:5%}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *{animation-duration:.01ms !important;animation-iteration-count:1 !important}
+  }
+</style>
+</head>
+<body>
+
+<canvas id="sky"></canvas>
+<div class="galaxy"></div>
+
+<div class="moon-wrap" aria-hidden="true">
+  <div class="halo2"></div>
+  <div class="halo"></div>
+  <div class="moon"></div>
+</div>
+
+<!-- 远山剪影 -->
+<div class="mountains" aria-hidden="true">
+  <svg viewBox="0 0 1440 320" preserveAspectRatio="none">
+    <path fill="#0c0f28" d="M0,220 C180,160 300,250 480,210 C640,175 760,260 960,225 C1140,195 1280,255 1440,215 L1440,320 L0,320 Z"/>
+    <path fill="#131638" opacity="0.8" d="M0,260 C220,230 360,285 560,265 C760,245 880,290 1080,270 C1240,255 1360,290 1440,270 L1440,320 L0,320 Z"/>
+  </svg>
+</div>
+
+<!-- 古塔剪影 -->
+<svg class="tower" viewBox="0 0 120 300" aria-hidden="true">
+  <defs>
+    <linearGradient id="tg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1736"/><stop offset="1" stop-color="#0a0c20"/>
+    </linearGradient>
+  </defs>
+  <g fill="url(#tg)" stroke="#2a2350" stroke-width="1">
+    <rect x="52" y="40" width="16" height="20"/>
+    <polygon points="46,60 74,60 70,72 50,72"/>
+    <rect x="44" y="72" width="32" height="6"/>
+    <polygon points="40,78 80,78 76,96 44,96"/>
+    <rect x="46" y="96" width="28" height="46"/>
+    <polygon points="38,142 82,142 78,156 42,156"/>
+    <rect x="40" y="156" width="40" height="8"/>
+    <polygon points="34,164 86,164 82,184 38,184"/>
+    <rect x="42" y="184" width="36" height="70"/>
+    <rect x="36" y="254" width="48" height="46"/>
+  </g>
+  <!-- 灯火 -->
+  <circle cx="60" cy="118" r="2.2" fill="#ffcf7a"><animate attributeName="opacity" values="1;.5;1" dur="2.4s" repeatCount="indefinite"/></circle>
+  <circle cx="60" cy="212" r="2.2" fill="#ffcf7a"><animate attributeName="opacity" values=".6;1;.6" dur="3.1s" repeatCount="indefinite"/></circle>
+</svg>
+
+<main class="stage">
+  <h1 class="title"><span class="ch">千</span><span class="ch">里</span><span class="ch">共</span><span class="ch">婵</span><span class="ch">娟</span></h1>
+  <p class="subtitle">丙午 七夕</p>
+  <div class="poem">
+    <span class="ln"><span>明月几时有？把酒问青天。</span></span>
+    <span class="ln"><span>人有悲欢离合，月有阴晴圆缺，</span></span>
+    <span class="ln"><span>但愿人长久，千里共婵娟。</span></span>
+    <span class="src">—— 苏轼《水调歌头》</span>
+  </div>
+</main>
+
+<canvas id="petals"></canvas>
+<div id="lanterns"></div>
+
+<div class="wish-area">
+  <div class="wish-hint">轻触夜空 · 放飞祈愿</div>
+  <form class="wish-input" id="wishForm">
+    <input id="wishText" type="text" maxlength="24" placeholder="写下你的心愿，让明月寄去远方…" autocomplete="off">
+    <button class="wish-btn" type="submit">祈愿</button>
+  </form>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="credit">但愿人长久</div>
+
+<script>
+/* =========================================================
+   星空：星星闪烁 + 偶发流星
+   ========================================================= */
+const sky = document.getElementById('sky');
+const sctx = sky.getContext('2d');
+let stars=[], meteors=[];
+function resizeSky(){
+  sky.width = innerWidth; sky.height = innerHeight;
+  stars = [];
+  const count = Math.floor(innerWidth*innerHeight/4200);
+  for(let i=0;i<count;i++){
+    stars.push({
+      x:Math.random()*sky.width,
+      y:Math.random()*sky.height*0.92,
+      r:Math.random()*1.4+0.3,
+      a:Math.random(),
+      tw:Math.random()*0.02+0.004,
+      hue:Math.random()<0.15? 'rgba(255,210,160,' : 'rgba(220,225,255,'
+    });
+  }
+}
+function spawnMeteor(){
+  if(meteors.length>2) return;
+  meteors.push({
+    x:Math.random()*sky.width*0.6+sky.width*0.3,
+    y:Math.random()*sky.height*0.4,
+    len:Math.random()*120+90,
+    sp:Math.random()*6+7,
+    ang:Math.PI/4 + (Math.random()*0.2-0.1),
+    life:1
+  });
+}
+function drawSky(){
+  sctx.clearRect(0,0,sky.width,sky.height);
+  for(const s of stars){
+    s.a += s.tw;
+    if(s.a>1||s.a<0){s.tw=-s.tw}
+    const alpha = Math.abs(Math.sin(s.a))*0.9+0.1;
+    sctx.beginPath();
+    sctx.arc(s.x,s.y,s.r,0,Math.PI*2);
+    sctx.fillStyle = s.hue+alpha+')';
+    sctx.fill();
+  }
+  for(let i=meteors.length-1;i>=0;i--){
+    const m=meteors[i];
+    const tx=m.x-Math.cos(m.ang)*m.len, ty=m.y-Math.sin(m.ang)*m.len;
+    const g=sctx.createLinearGradient(m.x,m.y,tx,ty);
+    g.addColorStop(0,'rgba(255,255,255,'+(0.9*m.life)+')');
+    g.addColorStop(0.3,'rgba(255,220,180,'+(0.5*m.life)+')');
+    g.addColorStop(1,'rgba(255,220,180,0)');
+    sctx.strokeStyle=g;sctx.lineWidth=2;sctx.lineCap='round';
+    sctx.beginPath();sctx.moveTo(m.x,m.y);sctx.lineTo(tx,ty);sctx.stroke();
+    m.x+=Math.cos(m.ang)*m.sp; m.y+=Math.sin(m.ang)*m.sp; m.life-=0.01;
+    if(m.life<=0||m.x>sky.width||m.y>sky.height) meteors.splice(i,1);
+  }
+  requestAnimationFrame(drawSky);
+}
+setInterval(()=>{ if(Math.random()<0.6) spawnMeteor(); }, 2600);
+resizeSky(); drawSky();
+
+/* =========================================================
+   花瓣 / 萤火粒子飘落
+   ========================================================= */
+const petals = document.getElementById('petals');
+const pctx = petals.getContext('2d');
+let parts=[];
+function resizePetals(){
+  petals.width=innerWidth;petals.height=innerHeight;
+  const n=Math.floor(innerWidth/22);
+  parts=[];
+  for(let i=0;i<n;i++) parts.push(makePart(true));
+}
+function makePart(rand){
+  const type = Math.random();
+  return {
+    x:Math.random()*petals.width,
+    y: rand? Math.random()*petals.height : -20,
+    size: Math.random()*3+1.2,
+    sp: Math.random()*0.6+0.25,
+    sway: Math.random()*1.2+0.4,
+    phase: Math.random()*Math.PI*2,
+    glow: type<0.55,                 // 萤火 or 花瓣
+    color: type<0.55
+      ? (Math.random()<0.5? '255,210,140':'180,255,210')
+      : (Math.random()<0.5? '255,150,175':'230,190,220'),
+    rot: Math.random()*Math.PI
+  };
+}
+function drawPetals(){
+  pctx.clearRect(0,0,petals.width,petals.height);
+  for(const p of parts){
+    p.phase+=0.03; p.y+=p.sp; p.x+=Math.sin(p.phase)*p.sway*0.3; p.rot+=0.01;
+    if(p.y>petals.height+10){ Object.assign(p, makePart(false)); }
+    if(p.glow){
+      const g=pctx.createRadialGradient(p.x,p.y,0,p.x,p.y,p.size*4);
+      g.addColorStop(0,'rgba('+p.color+',0.9)');
+      g.addColorStop(1,'rgba('+p.color+',0)');
+      pctx.fillStyle=g;
+      pctx.beginPath();pctx.arc(p.x,p.y,p.size*4,0,Math.PI*2);pctx.fill();
+    }else{
+      pctx.save();pctx.translate(p.x,p.y);pctx.rotate(p.rot);
+      pctx.fillStyle='rgba('+p.color+',0.7)';
+      pctx.beginPath();
+      pctx.ellipse(0,0,p.size,p.size*0.55,0,0,Math.PI*2);
+      pctx.fill();
+      pctx.restore();
+    }
+  }
+  requestAnimationFrame(drawPetals);
+}
+resizePetals(); drawPetals();
+
+addEventListener('resize',()=>{ resizeSky(); resizePetals(); });
+
+/* =========================================================
+   祈愿孔明灯（点击 / 提交）
+   ========================================================= */
+const lanternLayer = document.getElementById('lanterns');
+const toast = document.getElementById('toast');
+function showToast(msg){
+  toast.textContent=msg; toast.classList.add('show');
+  clearTimeout(showToast._t); showToast._t=setTimeout(()=>toast.classList.remove('show'),2200);
+}
+function releaseLantern(text){
+  const startX = Math.random()*innerWidth*0.6+innerWidth*0.2;
+  const startY = innerHeight-90;
+  const drift = (Math.random()*2-1)*120;
+  const dur = 9000 + Math.random()*4000;
+
+  const el = document.createElement('div');
+  el.style.cssText='position:absolute;will-change:transform,opacity;transform:translate(-50%,-50%)';
+  el.innerHTML = `
+    <svg width="46" height="64" viewBox="0 0 46 64">
+      <defs>
+        <radialGradient id="lg${Math.random()}" cx="50%" cy="45%" r="60%">
+          <stop offset="0" stop-color="#fff4cf"/>
+          <stop offset=".6" stop-color="#ffc46b"/>
+          <stop offset="1" stop-color="#e8772f"/>
+        </radialGradient>
+      </defs>
+      <ellipse cx="23" cy="30" rx="17" ry="22" fill="#ffb15a" opacity=".55"/>
+      <ellipse cx="23" cy="30" rx="13" ry="17" fill="url(#lg${Math.random()})"/>
+      <rect x="20" y="49" width="6" height="9" rx="2" fill="#3a2a1a"/>
+      <path d="M18 58 Q23 64 28 58" stroke="#c9742f" stroke-width="2" fill="none" opacity=".8"/>
+    </svg>`;
+  if(text){
+    const lbl=document.createElement('div');
+    lbl.textContent=text;
+    lbl.style.cssText='position:absolute;left:50%;top:-22px;transform:translateX(-50%);font-family:var(--kai);font-size:14px;color:#ffe6b0;text-shadow:0 0 8px rgba(255,180,90,.8);white-space:nowrap;';
+    el.appendChild(lbl);
+  }
+  lanternLayer.appendChild(el);
+
+  const anim = el.animate([
+    { transform:`translate(${startX}px, ${startY}px) scale(.6)`, opacity:0 },
+    { transform:`translate(${startX+drift*0.3}px, ${startY-innerHeight*0.4}px) scale(1)`, opacity:1, offset:.2 },
+    { transform:`translate(${startX+drift}px, ${-120}px) scale(.7)`, opacity:0 }
+  ], { duration:dur, easing:'cubic-bezier(.3,.1,.5,1)' });
+  anim.onfinish=()=>el.remove();
+}
+
+/* 点击空白处也能放灯（自动随机寄语） */
+const autoWishes=['愿岁岁长相见','愿君安好','花好月圆','相思入梦','岁岁常相见','此情可待','星河长明'];
+document.addEventListener('click',(e)=>{
+  if(e.target.closest('.wish-area')||e.target.closest('.toast')) return;
+  releaseLantern();
+});
+
+/* 提交祈愿 */
+document.getElementById('wishForm').addEventListener('submit',(e)=>{
+  e.preventDefault();
+  const input=document.getElementById('wishText');
+  const v=input.value.trim();
+  if(!v){ showToast('且把心愿诉与明月'); return; }
+  releaseLantern(v);
+  showToast('心愿已寄予明月，愿得圆满 ✦');
+  input.value='';
+});
+
+/* 进场送一盏灯 */
+setTimeout(()=>releaseLantern('千里共婵娟'), 4200);
+</script>
+</body>
+</html>

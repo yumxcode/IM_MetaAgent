@@ -1,0 +1,33 @@
+{
+  "name": "wechat-claude-bridge",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "start": "node weixin-login-check.mjs --listen",
+    "check": "node weixin-login-check.mjs --check",
+    "login": "node weixin-login-check.mjs --login",
+    "accounts": "node weixin-login-check.mjs --accounts",
+    "listen": "node weixin-login-check.mjs --listen",
+    "logout": "node weixin-login-check.mjs --logout",
+    "agent": "node weixin-meta-agent.mjs",
+    "agent:check": "node weixin-meta-agent.mjs --check",
+    "agent:login": "node weixin-meta-agent.mjs --login",
+    "demo:claude": "node wechat-claude-bridge.mjs",
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.81",
+    "@meta-agent/runtime": "*",
+    "qrcode-terminal": "^0.12.0",
+    "silk-wasm": "^3.6.1"
+  }
+}
