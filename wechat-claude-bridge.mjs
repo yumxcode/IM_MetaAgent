@@ -26,6 +26,7 @@ const require = createRequire(import.meta.url);
 try { require("dotenv").config(); } catch {}
 
 import { WeixinBot, log } from "./src/index.mjs";
+import { installProcessGuards } from "./src/process-guard.mjs";
 
 // Claude Agent SDK 是可选依赖：未安装时降级为回声模式
 let queryClaude = null;
@@ -155,15 +156,17 @@ async function main() {
     log.error(`轮询错误`, { err: String(err) });
   });
   bot.on("session-expired", (accountId) => {
-    log.error(`Session 过期，请重新登录`, { accountId });
-    console.error(`\n❌ Session 过期（账号 ${accountId}）。请重新运行: node wechat-claude-bridge.mjs --login\n`);
-    process.exit(1);
+    log.warn(`Session 过期，进入熔断保护`, { accountId });
+    console.error(`\n⏸️  Session 过期（账号 ${accountId}）。已进入熔断保护，暂停约 60 分钟后自动重试。`);
+    console.error(`    如需立即恢复，请重新运行: node wechat-claude-bridge.mjs --login\n`);
   });
 
   // 启动长轮询（阻塞）
   console.log("🚀 开始监听消息（Ctrl+C 退出）...\n");
   await bot.start();
 }
+
+installProcessGuards();
 
 main().catch((err) => {
   console.error("Fatal:", err.message);

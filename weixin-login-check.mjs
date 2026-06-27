@@ -31,6 +31,7 @@ import {
   WeixinTimeoutError,
   SESSION_EXPIRED_ERRCODE,
 } from "./src/index.mjs";
+import { installProcessGuards } from "./src/process-guard.mjs";
 
 // ---------------------------------------------------------------------------
 // token 自检：用一次短超时 getUpdates 探测 token 是否可用
@@ -186,8 +187,8 @@ async function cmdListen() {
 
   bot.on("error", (err) => log.error(`轮询错误`, { err: String(err) }));
   bot.on("session-expired", (accountId) => {
-    console.error(`\n❌ Session 过期（账号 ${accountId}）。请重新运行: node weixin-login-check.mjs --login\n`);
-    process.exit(1);
+    console.error(`\n⏸️  Session 过期（账号 ${accountId}）。已进入熔断保护，暂停约 60 分钟后自动重试。`);
+    console.error(`    如需立即恢复，请重新运行: node weixin-login-check.mjs --login\n`);
   });
 
   console.log("\n🚀 进入回声监听模式（Ctrl+C 退出）...");
@@ -240,6 +241,8 @@ async function main() {
   // 默认行为：--check
   return cmdCheck();
 }
+
+installProcessGuards();
 
 main().catch((err) => {
   console.error("Fatal:", err?.stack ?? err?.message ?? err);

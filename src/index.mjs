@@ -273,6 +273,11 @@ class WeixinBot {
       loadSyncBuf: () => loadSyncBuf(accountId),
       saveSyncBuf: (buf) => saveSyncBuf(accountId, buf),
       abortSignal: controller.signal,
+      // session 暂停恢复后重新读取凭据（用户可能在另一终端 --login 刷新了 token）
+      reloadCredentials: () => {
+        const fresh = this._account(accountId);
+        return { token: fresh.token, baseUrl: fresh.baseUrl };
+      },
       onMessage: async (rawMsg, aid) => {
         await this._handleInbound(rawMsg, aid);
       },

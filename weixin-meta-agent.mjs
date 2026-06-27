@@ -24,11 +24,12 @@
  *
  * 环境变量（建议放 .env）:
  *   # ---- meta-agent 配置 ----
- *   META_AGENT_MODE          detect|agentic|auto|campaign|robotics，默认 auto
- *                            （auto = 自主模式，workspace 内写操作自动批准）
+ *   META_AGENT_MODE          simple_auto|auto|detect|agentic|campaign|robotics，默认 simple_auto
+ *                            （simple_auto = 简单场景轻量自主；用 /goal <目标> 切换为 auto 完整自主）
  *   META_AGENT_MAX_TURNS     最大轮数，默认 30
  *   META_AGENT_TIMEOUT_MS    单任务超时，默认 0=不限
  *   META_AGENT_CLONE_TIMEOUT_MS  git clone 超时，默认 600000（10 min）
+ *   META_AGENT_MAX_CONCURRENT    最大并发任务数，默认 2（超过回复"系统繁忙"）
  *
  *   # ---- 触发与权限 ----
  *   WEIXIN_TRIGGER_PREFIX    群聊触发前缀，默认 "/"
@@ -53,6 +54,7 @@ import fs from "node:fs";
 import { WeixinBot, log } from "./src/index.mjs";
 import { resolveStateDir, readJson, writeJson, ensureDir } from "./src/util.mjs";
 import { checkMetaAgent, runMetaAgent } from "./src/meta-agent-bridge.mjs";
+import { installProcessGuards } from "./src/process-guard.mjs";
 
 // ---------------------------------------------------------------------------
 // 状态目录（与 auth.mjs 一致：优先 weixin-bot，回退 openclaw-weixin）
@@ -70,10 +72,11 @@ function stateSubDir() {
 
 const CFG = {
   // meta-agent
-  mode: process.env.META_AGENT_MODE || "auto",
+  mode: process.env.META_AGENT_MODE || "simple_auto",
   maxTurns: Number(process.env.META_AGENT_MAX_TURNS) || 30,
   timeoutMs: Number(process.env.META_AGENT_TIMEOUT_MS) || 0,
   cloneTimeoutMs: Number(process.env.META_AGENT_CLONE_TIMEOUT_MS) || 600_000,
+  maxConcurrent: Number(process.env.META_AGENT_MAX_CONCURRENT) || 2,
 
   // 触发与权限
   triggerPrefix: process.env.WEIXIN_TRIGGER_PREFIX ?? "/",
@@ -182,7 +185,7 @@ function resolveSessionDir(accountId) {
 // ---------------------------------------------------------------------------
 
 /**
- * @returns {{action:"clear"|"project"|"respond"|"ignore", subcmd?, args?, prompt?}}
+ * @returns {{action:"clear"|"project"|"respond"|"goal"|"ignore", subcmd?, args?, prompt?}}
  */
 function parseTrigger(msg) {
   const raw = msg.text?.trim();
@@ -197,6 +200,12 @@ function parseTrigger(msg) {
     const sub = parts[0] || "";
     const args = parts.slice(1);
     return { action: "project", subcmd: sub, args };
+  }
+
+  // /goal 指令: 用 auto 完整自主模式执行复杂目标（私聊群聊均识别）
+  if (raw === "/goal" || raw?.startsWith("/goal ")) {
+    const goalPrompt = raw === "/goal" ? "" : raw.slice(6).trim();
+    return { action: "goal", prompt: goalPrompt };
   }
 
   // 白名单
@@ -430,6 +439,7 @@ async function sendReply(bot, msg, r) {
 // ---------------------------------------------------------------------------
 
 const userLocks = new Map();
+let activeTaskCount = 0; // 当前正在执行的 meta-agent 任务数（全局并发信号量）
 
 async function handleMessage(bot, msg) {
   const trig = parseTrigger(msg);
@@ -460,7 +470,22 @@ async function handleMessage(bot, msg) {
     return;
   }
 
-  // ── respond：调用 meta-agent ──
+  // ── respond / goal：调用 meta-agent ──
+
+  // /goal 无参数：提示用法
+  if (trig.action === "goal" && !trig.prompt) {
+    await bot.reply(msg, "用法: /goal <目标描述>\n例: /goal 把这个项目重构为 TypeScript").catch(() => {});
+    return;
+  }
+
+  // 模式选择：/goal 用完整 auto 自主，普通对话用默认（simple_auto）
+  const agentMode = trig.action === "goal" ? "auto" : CFG.mode;
+
+  // 全局并发限制：最多同时处理 maxConcurrent 个任务
+  if (activeTaskCount >= CFG.maxConcurrent) {
+    await bot.reply(msg, `⏳ 系统繁忙，当前已有 ${activeTaskCount} 个任务在处理，请稍后再试。`).catch(() => {});
+    return;
+  }
 
   // 同用户串行
   if (userLocks.get(from)) {
@@ -468,6 +493,7 @@ async function handleMessage(bot, msg) {
     return;
   }
   userLocks.set(from, true);
+  activeTaskCount++;
 
   const typing = await bot.typing({ to: from, contextToken: msg.contextToken }).catch(() => null);
   await typing?.start().catch(() => {});
@@ -496,7 +522,7 @@ async function handleMessage(bot, msg) {
 
     const r = await runMetaAgent(trig.prompt, {
       workspace,
-      mode: CFG.mode,
+      mode: agentMode,
       maxTurns: CFG.maxTurns,
       timeoutMs: CFG.timeoutMs,
       resumeSessionId: resumeId,
@@ -518,6 +544,7 @@ async function handleMessage(bot, msg) {
     log.error(`meta-agent 执行异常`, { err: String(err) });
     await bot.reply(msg, `❌ 执行异常：${err.message}`).catch(() => {});
   } finally {
+    activeTaskCount--;
     userLocks.set(from, false);
     await typing?.stop().catch(() => {});
   }
@@ -540,6 +567,7 @@ async function cmdCheck() {
   console.log(`   maxTurns  : ${CFG.maxTurns}`);
   console.log(`   timeout   : ${CFG.timeoutMs > 0 ? CFG.timeoutMs + " ms" : "不限"}`);
   console.log(`   clone超时 : ${CFG.cloneTimeoutMs} ms`);
+  console.log(`   最大并发  : ${CFG.maxConcurrent}`);
   console.log(`   群聊策略  : ${CFG.groupTrigger}${CFG.groupTrigger === "prefix" ? ` (前缀 "${CFG.triggerPrefix}")` : ""}`);
   console.log(`   白名单    : ${CFG.allowFrom.length ? CFG.allowFrom.join(", ") : "(不限)"}`);
 }
@@ -588,17 +616,20 @@ async function cmdRun() {
   bot.on("message", (msg) => { handleMessage(bot, msg).catch((e) => log.error("handleMessage", { err: String(e) })); });
   bot.on("error", (err) => log.error(`轮询错误`, { err: String(err) }));
   bot.on("session-expired", (accountId) => {
-    console.error(`\n❌ Session 过期（${accountId}）。重新运行: node weixin-meta-agent.mjs --login\n`);
-    process.exit(1);
+    console.error(`\n⏸️  Session 过期（账号 ${accountId}）。`);
+    console.error(`    已进入熔断保护，暂停约 60 分钟后自动重试轮询（期间不会高频请求服务器）。`);
+    console.error(`    如需立即恢复，请在另一终端运行: node weixin-meta-agent.mjs --login\n`);
   });
 
   console.log("🤖 微信 ↔ meta-agent 桥接已启动");
   console.log(`   meta-agent : ${mc.version}`);
   console.log(`   项目根目录 : ${PROJECTS_DIR}`);
   console.log(`   会话持久化 : 每项目独立 session（微信发 /clear 清当前项目会话）`);
+  console.log(`   默认模式   : ${CFG.mode}（/goal <目标> 切换为 auto 完整自主）`);
   console.log(`   私聊       : 全响应（无项目时自动创建临时项目）`);
   console.log(`   群聊       : ${CFG.groupTrigger === "off" ? "不响应" : CFG.groupTrigger === "all" ? "全响应" : `需前缀 "${CFG.triggerPrefix}"`}`);
   console.log(`   项目指令   : /p（私聊群聊均识别）`);
+  console.log(`   最大并发   : ${CFG.maxConcurrent}（超过回复"系统繁忙"）`);
   console.log(`   白名单     : ${CFG.allowFrom.length ? CFG.allowFrom.join(", ") : "(不限)"}`);
   console.log("   Ctrl+C 退出\n");
   await bot.start();
@@ -624,6 +655,7 @@ function printHelp() {
   /p <名称>           切换到指定项目
   /p rm <名称>        删除项目（代码 + 会话）
   无项目时发文本       自动创建临时项目
+  /goal <目标>        用 auto 完整自主模式执行复杂目标（默认对话为 simple_auto）
 
 环境变量见脚本头部注释。
 `);
@@ -641,6 +673,8 @@ async function main() {
   if (args.includes("--check")) return cmdCheck();
   return cmdRun();
 }
+
+installProcessGuards();
 
 main().catch((err) => {
   console.error("Fatal:", err?.stack ?? err?.message ?? err);

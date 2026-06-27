@@ -61,13 +61,34 @@ export async function startPolling(opts) {
     longPollTimeoutMs = DEFAULT_LONG_POLL_TIMEOUT_MS,
     routeTag,
     shouldPause = isSessionPaused,
+    reloadCredentials,
   } = opts;
 
   const aLog = (level, msg, meta) => log[level](`[${accountId}] ${msg}`, meta);
 
+  // 可变凭据：session 暂停恢复后通过 reloadCredentials() 刷新
+  // （用户可能在另一终端 --login 扫码，token 已写入文件）
+  let currentToken = token;
+  let currentBaseUrl = baseUrl;
+
+  /** 暂停恢复后重新加载凭据，使刷新后的 token 立即生效。 */
+  const refreshCreds = () => {
+    if (!reloadCredentials) return;
+    try {
+      const fresh = reloadCredentials();
+      if (fresh?.token) {
+        currentToken = fresh.token;
+        aLog("info", `credentials reloaded after session pause`);
+      }
+      if (fresh?.baseUrl) currentBaseUrl = fresh.baseUrl;
+    } catch (err) {
+      aLog("warn", `reloadCredentials failed, keeping previous token`, { err: String(err) });
+    }
+  };
+
   // 初始游标：参数 > 持久化值 > 空字符串
   let getUpdatesBuf = initialGetUpdatesBuf ?? loadSyncBuf?.() ?? "";
-  aLog("info", `polling started`, { baseUrl, hasBuf: Boolean(getUpdatesBuf), bufLen: getUpdatesBuf.length });
+  aLog("info", `polling started`, { baseUrl: currentBaseUrl, hasBuf: Boolean(getUpdatesBuf), bufLen: getUpdatesBuf.length });
 
   let nextTimeoutMs = longPollTimeoutMs;
   let consecutiveFailures = 0;
@@ -82,14 +103,15 @@ export async function startPolling(opts) {
       } catch {
         // aborted
       }
+      refreshCreds();
       continue;
     }
 
     try {
       aLog("debug", `getUpdates`, { bufHead: getUpdatesBuf.slice(0, 50), timeoutMs: nextTimeoutMs });
       const resp = await getUpdates({
-        baseUrl,
-        token,
+        baseUrl: currentBaseUrl,
+        token: currentToken,
         getUpdatesBuf,
         timeoutMs: nextTimeoutMs,
         routeTag,
@@ -111,6 +133,7 @@ export async function startPolling(opts) {
           onError?.(new Error(`session expired: ${resp.errmsg ?? ""}`));
           consecutiveFailures = 0;
           try { await sleep(pauseMs, abortSignal); } catch { /* aborted */ }
+          refreshCreds();
           continue;
         }
         consecutiveFailures += 1;
