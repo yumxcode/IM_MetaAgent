@@ -1,0 +1,30 @@
+[Unit]
+Description=IM MetaAgent (WeChat <-> meta-agent bridge)
+Documentation=https://github.com/yumxcode/IM_MetaAgent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=/bin/bash __PROJECT_DIR__/deploy/start.sh
+
+# 崩溃自动重启（非0退出/信号），正常退出(exit 0)不重启
+Restart=on-failure
+RestartSec=15
+# 5 分钟内最多重启 10 次，超出后停止（防 OOM 疯狂重启）
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# 日志：写入项目 logs/ 目录（同时 journald 也会捕获，可用 journalctl 查看）
+StandardOutput=append:__PROJECT_DIR__/logs/im-metaagent.out.log
+StandardError=append:__PROJECT_DIR__/logs/im-metaagent.err.log
+
+# 优雅关闭：SIGTERM 给 node 主进程，10s 后仍未退出则 SIGKILL
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
