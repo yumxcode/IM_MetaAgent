@@ -25,67 +25,13 @@ try { require("dotenv").config(); } catch {}
 import {
   WeixinBot,
   log,
-  getUpdates,
-  WeixinHttpError,
-  WeixinApiError,
-  WeixinTimeoutError,
-  SESSION_EXPIRED_ERRCODE,
 } from "./src/index.mjs";
-import { installProcessGuards } from "./src/process-guard.mjs";
+import { checkAccountHealth as checkToken } from "./src/account-health.mjs";
+import { installProcessGuards, installGracefulShutdown } from "./src/process-guard.mjs";
 
 // ---------------------------------------------------------------------------
-// token 自检：用一次短超时 getUpdates 探测 token 是否可用
+// token 自检使用 getConfig，不消费消息或修改长轮询游标。
 // ---------------------------------------------------------------------------
-
-/**
- * @typedef {"valid"|"expired"|"invalid"|"network_error"|"unknown"} CheckResult
- */
-
-/**
- * 探测账号 token 当前是否可用。
- * 思路：发起一次很短（默认 3s）的 getUpdates 长轮询：
- *  - 返回 ret=0          → token 有效（可能带回少量积压消息）
- *  - WeixinTimeoutError  → token 有效（服务器 hold 到客户端超时，正常）
- *  - WeixinApiError      → 看 errcode：-14 = session 过期需重新登录；其他 = 鉴权/参数错误
- *  - WeixinHttpError     → 401/403 等 HTTP 层错误
- *  - 其他网络异常         → 连不通
- *
- * @param {{baseUrl:string, token:string, timeoutMs?:number}} account
- * @returns {Promise<{result:CheckResult, detail:string, raw?:object, errcode?:number}>}
- */
-async function checkToken({ baseUrl, token, timeoutMs = 3000 }) {
-  if (!token) return { result: "invalid", detail: "no token stored" };
-  try {
-    const resp = await getUpdates({
-      baseUrl,
-      token,
-      getUpdatesBuf: "",
-      timeoutMs,
-    });
-    const msgCount = Array.isArray(resp.msgs) ? resp.msgs.length : 0;
-    return {
-      result: "valid",
-      detail: `token 有效（本次长轮询返回 ${msgCount} 条积压消息）`,
-      raw: resp,
-    };
-  } catch (err) {
-    if (err instanceof WeixinTimeoutError) {
-      return { result: "valid", detail: "token 有效（服务器 hold 到客户端超时，无新消息）" };
-    }
-    if (err instanceof WeixinApiError) {
-      const errcode = err.info?.errcode;
-      if (errcode === SESSION_EXPIRED_ERRCODE) {
-        return { result: "expired", detail: `session 已过期（errcode=${errcode}），需重新 --login`, errcode };
-      }
-      return { result: "invalid", detail: `业务错误 ret=${err.info?.ret} errcode=${errcode} errmsg=${err.info?.errmsg ?? ""}`, errcode };
-    }
-    if (err instanceof WeixinHttpError) {
-      return { result: "invalid", detail: `HTTP ${err.info?.status}: ${err.info?.body ?? ""}` };
-    }
-    return { result: "network_error", detail: String(err?.message ?? err) };
-  }
-}
-
 // ---------------------------------------------------------------------------
 // 子命令实现
 // ---------------------------------------------------------------------------
@@ -112,6 +58,7 @@ async function cmdAccounts() {
 async function cmdLogin() {
   const bot = new WeixinBot();
   const result = await bot.login();
+  if (result.connected === false) { console.error(result.message); process.exitCode = 1; return result; }
   console.log("\n📦 凭据已持久化，后续运行无需扫码。");
   return result;
 }
@@ -144,7 +91,7 @@ async function cmdCheck() {
   for (const id of ids) {
     const acct = bot._account(id);
     process.stdout.write(`  ${id} ... `);
-    const r = await checkToken({ baseUrl: acct.baseUrl, token: acct.token, timeoutMs });
+    const r = await checkToken({ baseUrl: acct.baseUrl, token: acct.token, userId: bot.getAccountInfo(id)?.userId, timeoutMs });
     const icon =
       r.result === "valid" ? "✅" :
       r.result === "expired" ? "⏰" :
@@ -156,7 +103,7 @@ async function cmdCheck() {
   if (allValid) {
     console.log("🎉 所有账号 token 均有效。");
   } else {
-    console.log("⚠️  存在无效账号，请按提示重新 --login。");
+    console.log("⚠️  部分账号状态未确认，请根据上面的具体结果处理。");
   }
   return { allValid, accountIds: ids };
 }
@@ -168,7 +115,7 @@ async function cmdCheck() {
 async function cmdListen() {
   const { accountIds } = await cmdCheck();
   const bot = new WeixinBot();
-  bot.setDefaultAccount(accountIds[0]);
+  bot.setDefaultAccount(bot.getDefaultAccount());
 
   bot.on("message", async (msg) => {
     const preview = msg.text ? `"${msg.text.slice(0, 40)}"` : `[媒体:${msg.itemTypes?.join(",") ?? "?"}]`;
@@ -193,6 +140,7 @@ async function cmdListen() {
 
   console.log("\n🚀 进入回声监听模式（Ctrl+C 退出）...");
   console.log("   向该微信号发任意文本，会原样回复。\n");
+  installGracefulShutdown(bot);
   await bot.start();
 }
 
@@ -235,11 +183,11 @@ async function main() {
 
   if (args.includes("--accounts")) return cmdAccounts();
   if (args.includes("--login")) return cmdLogin();
-  if (args.includes("--check")) return cmdCheck();
+  if (args.includes("--check")) { const r = await cmdCheck(); if (!r.allValid) process.exitCode = 1; return; }
   if (args.includes("--listen")) return cmdListen();
 
   // 默认行为：--check
-  return cmdCheck();
+  const r = await cmdCheck(); if (!r.allValid) process.exitCode = 1;
 }
 
 installProcessGuards();

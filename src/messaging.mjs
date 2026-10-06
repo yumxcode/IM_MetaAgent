@@ -15,6 +15,7 @@
  * 与官方插件的 messaging 模块行为对齐。
  */
 import path from "node:path";
+import fs from "node:fs/promises";
 
 import { MessageItemType, MessageState, MessageType } from "./constants.mjs";
 import { sendMessage as sendMessageApi } from "./http.mjs";
@@ -22,7 +23,10 @@ import {
   downloadRemoteUrlToTemp,
   uploadLocalFile,
   UploadedFileInfo,
+  uploadVoice,
 } from "./media.mjs";
+import { StreamingMarkdownFilter } from "./markdown-filter.mjs";
+import { resolvePartialQuote } from "./partial-quote.mjs";
 import { log, generateId, isLocalFilePath, isRemoteUrl, resolveLocalPath } from "./util.mjs";
 
 // ---------------------------------------------------------------------------
@@ -30,7 +34,10 @@ import { log, generateId, isLocalFilePath, isRemoteUrl, resolveLocalPath } from 
 // ---------------------------------------------------------------------------
 
 const contextTokenStore = new Map();
-function ctxKey(accountId, userId) { return `${accountId}:${userId}`; }
+function ctxKey(accountId, userId) { return JSON.stringify([accountId, userId]); }
+export function clearContextTokens(accountId) {
+  for (const key of contextTokenStore.keys()) if (JSON.parse(key)[0] === accountId) contextTokenStore.delete(key);
+}
 
 /** 存储某 account+user 的 contextToken（入站时记录，出站时取用）。 */
 export function setContextToken(accountId, userId, token) {
@@ -51,26 +58,8 @@ export function getContextToken(accountId, userId) {
  * 与官方插件的 markdownToPlainText 行为一致。
  */
 export function markdownToPlainText(text) {
-  if (!text) return "";
-  let r = text;
-  // 代码块：去围栏，保留代码内容
-  r = r.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => code.trim());
-  // 图片：整体移除
-  r = r.replace(/!\[[^\]]*\]\([^)]*\)/g, "");
-  // 链接：仅保留显示文本
-  r = r.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
-  // 表格：去分隔行，竖线转空格
-  r = r.replace(/^\|[\s:|-]+\|$/gm, "");
-  r = r.replace(/^\|(.+)\|$/gm, (_, inner) =>
-    inner.split("|").map((c) => c.trim()).join("  "));
-  // 去掉剩余行内 markdown 语法
-  r = r.replace(/\*\*([^*]+)\*\*/g, "$1"); // 粗体
-  r = r.replace(/(^|[^*])\*([^*]+)\*/g, "$1$2"); // 斜体
-  r = r.replace(/`([^`]+)`/g, "$1"); // 行内代码
-  r = r.replace(/^#{1,6}\s+/gm, ""); // 标题
-  r = r.replace(/^>\s?/gm, ""); // 引用
-  r = r.replace(/^[-*+]\s+/gm, "- "); // 列表统一
-  return r.trim();
+  const filter = new StreamingMarkdownFilter();
+  return filter.feed(String(text ?? "")) + filter.flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -87,12 +76,13 @@ function genClientId() { return generateId("weixin-bot"); }
  * @param {string} [p.contextToken]
  * @param {number} [p.messageState=FINISH]
  */
-function buildMessageReq({ to, itemList, contextToken, messageState = MessageState.FINISH }) {
+function buildMessageReq({ to, itemList, contextToken, runId, clientId, messageState = MessageState.FINISH }) {
   return {
     msg: {
       from_user_id: "",
       to_user_id: to,
-      client_id: genClientId(),
+      client_id: clientId || genClientId(),
+      run_id: runId || undefined,
       message_type: MessageType.BOT,
       message_state: messageState,
       item_list: itemList.length ? itemList : undefined,
@@ -115,19 +105,15 @@ function textItem(text) {
  *
  * @returns {Promise<{messageId:string}>} messageId（即 client_id）
  */
-export async function sendText({ baseUrl, token, to, text, contextToken, timeoutMs, routeTag } = {}) {
-  if (!contextToken) {
-    throw new Error(`sendText: contextToken is required (to=${to})`);
-  }
-  const plain = markdownToPlainText(String(text ?? ""));
-  const req = buildMessageReq({ to, itemList: plain ? [textItem(plain)] : [], contextToken });
-  try {
-    await sendMessageApi({ baseUrl, token, msg: req.msg, timeoutMs, routeTag });
-  } catch (err) {
-    log.error(`sendText failed`, { to, err: String(err) });
-    throw err;
-  }
-  return { messageId: req.msg.client_id };
+export async function sendText(opts = {}) {
+  const { baseUrl, token, to, text, contextToken, timeoutMs, routeTag, runId, signal, onSent } = opts;
+  if (!contextToken) log.warn("sendText: no contextToken", { to });
+  const plain = markdownToPlainText(text);
+  const req = buildMessageReq({ to, itemList: plain ? [textItem(plain)] : [], contextToken, runId });
+  const resp = await sendMessageApi({ baseUrl, token, msg: req.msg, timeoutMs, routeTag, signal });
+  const result = { messageId: req.msg.client_id, serverMessageId: resp?.message_id };
+  await onSent?.({ ...result, body: plain });
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,36 +124,16 @@ export async function sendText({ baseUrl, token, to, text, contextToken, timeout
  * 发送一个媒体 item（可选附加文本 caption）。
  * caption 作为独立的 TEXT item 在媒体 item 之前发送。
  */
-async function sendMediaItem({ baseUrl, token, to, text, mediaItem, contextToken, timeoutMs, routeTag, label }) {
-  if (!contextToken) {
-    throw new Error(`${label}: contextToken is required (to=${to})`);
-  }
-  const items = [];
-  if (text) items.push(textItem(markdownToPlainText(text)));
-  items.push(mediaItem);
-
-  let lastClientId = "";
-  for (const item of items) {
-    lastClientId = genClientId();
-    const req = {
-      msg: {
-        from_user_id: "",
-        to_user_id: to,
-        client_id: lastClientId,
-        message_type: MessageType.BOT,
-        message_state: MessageState.FINISH,
-        item_list: [item],
-        context_token: contextToken || undefined,
-      },
-    };
-    try {
-      await sendMessageApi({ baseUrl, token, msg: req.msg, timeoutMs, routeTag });
-    } catch (err) {
-      log.error(`${label} failed`, { to, err: String(err) });
-      throw err;
-    }
-  }
-  return { messageId: lastClientId };
+async function sendMediaItem(opts) {
+  const { baseUrl, token, to, text, mediaItem, contextToken, timeoutMs, routeTag, runId, signal, onSent, sourceMediaPath } = opts;
+  if (!contextToken) log.warn("sendMedia: no contextToken", { to });
+  let result;
+  if (text) await sendText({ ...opts, onSent: async record => onSent?.({ ...record, sourceMediaPath: undefined }) });
+  const req = buildMessageReq({ to, itemList: [mediaItem], contextToken, runId });
+  const resp = await sendMessageApi({ baseUrl, token, msg: req.msg, timeoutMs, routeTag, signal });
+  result = { messageId: req.msg.client_id, serverMessageId: resp?.message_id };
+  await onSent?.({ ...result, body: mediaItem.voice_item?.text || text || "", sourceMediaPath, mediaName: mediaItem.file_item?.file_name });
+  return result;
 }
 
 /** 用已上传的文件信息构造图片 item。 */
@@ -177,7 +143,7 @@ export function buildImageItem(uploaded) {
     image_item: {
       media: {
         encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-        aes_key: Buffer.from(uploaded.aeskey, "hex").toString("base64"),
+        aes_key: Buffer.from(uploaded.aeskey).toString("base64"),
         encrypt_type: 1,
       },
       mid_size: uploaded.fileSizeCiphertext,
@@ -192,7 +158,7 @@ export function buildVideoItem(uploaded) {
     video_item: {
       media: {
         encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-        aes_key: Buffer.from(uploaded.aeskey, "hex").toString("base64"),
+        aes_key: Buffer.from(uploaded.aeskey).toString("base64"),
         encrypt_type: 1,
       },
       video_size: uploaded.fileSizeCiphertext,
@@ -207,7 +173,7 @@ export function buildFileItem(uploaded, fileName) {
     file_item: {
       media: {
         encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-        aes_key: Buffer.from(uploaded.aeskey, "hex").toString("base64"),
+        aes_key: Buffer.from(uploaded.aeskey).toString("base64"),
         encrypt_type: 1,
       },
       file_name: fileName,
@@ -220,75 +186,56 @@ export function buildFileItem(uploaded, fileName) {
  * 用已上传的文件信息发送图片。
  * @param {UploadedFileInfo} uploaded
  */
-export function sendImage({ baseUrl, token, to, text, uploaded, contextToken, timeoutMs, routeTag } = {}) {
-  return sendMediaItem({
-    baseUrl, token, to, text, mediaItem: buildImageItem(uploaded),
-    contextToken, timeoutMs, routeTag, label: "sendImage",
-  });
+export function sendImage(opts = {}) {
+  return sendMediaItem({ ...opts, mediaItem: buildImageItem(opts.uploaded) });
+}
+export function sendVideo(opts = {}) {
+  return sendMediaItem({ ...opts, mediaItem: buildVideoItem(opts.uploaded) });
+}
+export function sendFile(opts = {}) {
+  return sendMediaItem({ ...opts, mediaItem: buildFileItem(opts.uploaded, opts.fileName) });
+}
+export function buildVoiceItem(uploaded, opts = {}) {
+  return { type: MessageItemType.VOICE, voice_item: {
+    media: { encrypt_query_param: uploaded.downloadEncryptedQueryParam, aes_key: Buffer.from(uploaded.aeskey).toString("base64"), encrypt_type: 1 },
+    encode_type: 6, sample_rate: opts.sampleRate || 24000,
+    ...(opts.playtime !== undefined ? { playtime: opts.playtime } : {}),
+  } };
+}
+export function sendVoice(opts = {}) {
+  return sendMediaItem({ ...opts, mediaItem: buildVoiceItem(opts.uploaded, opts) });
+}
+export async function sendToolProgress(opts = {}) {
+  const { toolName, toolCallId, status, ...rest } = opts;
+  if (!toolName || !toolCallId) throw new Error("toolName and toolCallId are required");
+  const item = status === undefined
+    ? { type: MessageItemType.TOOL_CALL_START, tool_call_start_item: { tool_name: toolName, tool_call_id: toolCallId } }
+    : { type: MessageItemType.TOOL_CALL_RESULT, tool_call_result_item: { tool_name: toolName, tool_call_id: toolCallId, status } };
+  item.create_time_ms = Date.now(); item.is_completed = status !== undefined;
+  const req = buildMessageReq({ ...rest, itemList: [item] });
+  const resp = await sendMessageApi({ ...rest, msg: req.msg });
+  return { messageId: req.msg.client_id, serverMessageId: resp?.message_id };
 }
 
-/** 用已上传的文件信息发送视频。 */
-export function sendVideo({ baseUrl, token, to, text, uploaded, contextToken, timeoutMs, routeTag } = {}) {
-  return sendMediaItem({
-    baseUrl, token, to, text, mediaItem: buildVideoItem(uploaded),
-    contextToken, timeoutMs, routeTag, label: "sendVideo",
-  });
-}
-
-/** 用已上传的文件信息发送文件附件。 */
-export function sendFile({ baseUrl, token, to, text, fileName, uploaded, contextToken, timeoutMs, routeTag } = {}) {
-  return sendMediaItem({
-    baseUrl, token, to, text, mediaItem: buildFileItem(uploaded, fileName),
-    contextToken, timeoutMs, routeTag, label: "sendFile",
-  });
-}
-
-/**
- * 高层 API：发送本地或远程媒体文件，自动按 MIME 路由。
- *
- * mediaUrl 支持：
- *  - 本地绝对/相对路径：/tmp/a.png, ./pic.jpg
- *  - file:// URL
- *  - http(s):// URL（先下载到本地临时目录）
- *
- * @param {object} opts
- * @param {string} opts.mediaUrl
- * @param {string} [opts.destDir] - 远程文件下载临时目录，默认 os.tmpdir()/weixin-bot/media/outbound
- */
 export async function sendMedia(opts) {
-  const { baseUrl, token, to, text, mediaUrl, contextToken, timeoutMs, routeTag, destDir } = opts;
-  if (!contextToken) {
-    throw new Error(`sendMedia: contextToken is required (to=${to})`);
-  }
-  let filePath;
-  if (isLocalFilePath(mediaUrl)) {
-    filePath = resolveLocalPath(mediaUrl);
-    log.debug(`sendMedia: local file`, { filePath });
-  } else if (isRemoteUrl(mediaUrl)) {
+  const { mediaUrl, to, destDir, signal, timeoutMs } = opts;
+  let filePath, remote = false;
+  if (isLocalFilePath(mediaUrl)) filePath = resolveLocalPath(mediaUrl);
+  else if (isRemoteUrl(mediaUrl)) {
     const dest = destDir || path.join(await getDefaultMediaTempDir(), "outbound");
-    filePath = await downloadRemoteUrlToTemp(mediaUrl, dest);
-    log.debug(`sendMedia: remote downloaded`, { filePath });
-  } else {
-    throw new Error(`sendMedia: unsupported mediaUrl scheme: ${mediaUrl.slice(0, 80)}`);
-  }
-
-  const uploadOpts = { baseUrl, token, routeTag };
-  const cdnBaseUrl = opts.cdnBaseUrl || "https://novac2c.cdn.weixin.qq.com/c2c";
+    filePath = await downloadRemoteUrlToTemp(mediaUrl, dest, { signal, timeoutMs }); remote = true;
+  } else throw new Error("sendMedia: unsupported mediaUrl scheme");
+  try {
+  const uploadOpts = { baseUrl: opts.baseUrl, token: opts.token, routeTag: opts.routeTag, timeoutMs, signal };
+  const args = { filePath, toUserId: to, opts: uploadOpts, cdnBaseUrl: opts.cdnBaseUrl };
   const mime = (await import("./mime.mjs")).getMimeFromFilename(filePath);
-
-  if (mime.startsWith("video/")) {
-    const { uploadVideo } = await import("./media.mjs");
-    const uploaded = await uploadVideo({ filePath, toUserId: to, opts: uploadOpts, cdnBaseUrl });
-    return sendVideo({ baseUrl, token, to, text, uploaded, contextToken, timeoutMs, routeTag });
-  }
-  if (mime.startsWith("image/")) {
-    const { uploadImage } = await import("./media.mjs");
-    const uploaded = await uploadImage({ filePath, toUserId: to, opts: uploadOpts, cdnBaseUrl });
-    return sendImage({ baseUrl, token, to, text, uploaded, contextToken, timeoutMs, routeTag });
-  }
-  const { uploadFileAttachment } = await import("./media.mjs");
-  const uploaded = await uploadFileAttachment({ filePath, toUserId: to, opts: uploadOpts, cdnBaseUrl });
-  return sendFile({ baseUrl, token, to, text, fileName: path.basename(filePath), uploaded, contextToken, timeoutMs, routeTag });
+  const media = await import("./media.mjs");
+  const common = { ...opts, sourceMediaPath: filePath };
+  if (mime.startsWith("video/")) return await sendVideo({ ...common, uploaded: await media.uploadVideo(args) });
+  if (mime.startsWith("image/")) return await sendImage({ ...common, uploaded: await media.uploadImage(args) });
+  if (mime === "audio/silk") return await sendVoice({ ...common, uploaded: await uploadVoice(args) });
+  return await sendFile({ ...common, fileName: path.basename(filePath), uploaded: await media.uploadFileAttachment(args) });
+  } finally { if (remote) await fs.unlink(filePath).catch(() => {}); }
 }
 
 async function getDefaultMediaTempDir() {
@@ -313,32 +260,27 @@ async function getDefaultMediaTempDir() {
  *
  * @returns {{push:(text:string)=>Promise<void>, finish:(fullText:string)=>Promise<void>}}
  */
-export function createReplyStream({ baseUrl, token, to, contextToken, timeoutMs, routeTag } = {}) {
-  if (!contextToken) {
-    throw new Error(`createReplyStream: contextToken is required (to=${to})`);
+export function createReplyStream(opts = {}) {
+  let fullText = "", plain = "", finished = false, chain = Promise.resolve();
+  const filter = new StreamingMarkdownFilter();
+  const clientId = genClientId();
+  function enqueue(fn) { const next = chain.then(fn); chain = next.catch(() => {}); return next; }
+  async function send(value, state) {
+    const req = buildMessageReq({ ...opts, clientId, itemList: value ? [textItem(value)] : [], messageState: state });
+    const resp = await sendMessageApi({ ...opts, msg: req.msg });
+    const result = { messageId: clientId, serverMessageId: resp?.message_id };
+    if (state === MessageState.FINISH) await opts.onSent?.({ ...result, body: value });
+    return result;
   }
-  let fullText = "";
   return {
-    async push(chunk) {
-      fullText += chunk;
-      const req = buildMessageReq({
-        to,
-        itemList: [textItem(markdownToPlainText(fullText))],
-        contextToken,
-        messageState: MessageState.GENERATING,
-      });
-      await sendMessageApi({ baseUrl, token, msg: req.msg, timeoutMs, routeTag });
+    push(chunk) {
+      if (finished) return Promise.reject(new Error("stream already finished"));
+      return enqueue(async () => { fullText += String(chunk); plain += filter.feed(String(chunk)); return send(plain, MessageState.GENERATING); });
     },
-    async finish(finalText) {
-      const text = finalText !== undefined ? finalText : fullText;
-      const req = buildMessageReq({
-        to,
-        itemList: text ? [textItem(markdownToPlainText(text))] : [],
-        contextToken,
-        messageState: MessageState.FINISH,
-      });
-      await sendMessageApi({ baseUrl, token, msg: req.msg, timeoutMs, routeTag });
-      return { messageId: req.msg.client_id };
+    finish(finalText) {
+      if (finished) return Promise.reject(new Error("stream already finished"));
+      finished = true;
+      return enqueue(() => send(finalText === undefined ? plain + filter.flush() : markdownToPlainText(finalText), MessageState.FINISH));
     },
   };
 }
@@ -363,70 +305,49 @@ export function isMediaItem(item) {
  * 从 item_list 提取纯文本内容。
  * 处理：文本、引用消息、语音转文字。
  */
-export function extractText(itemList) {
-  if (!itemList?.length) return "";
-  for (const item of itemList) {
-    if (item.type === MessageItemType.TEXT && item.text_item?.text != null) {
-      const text = String(item.text_item.text);
-      const ref = item.ref_msg;
-      if (!ref) return text;
-      // 引用媒体：仅返回当前文本
-      if (ref.message_item && isMediaItem(ref.message_item)) return text;
-      // 引用文本：拼接引用上下文
-      const parts = [];
-      if (ref.title) parts.push(ref.title);
-      if (ref.message_item) {
-        const refBody = extractText([ref.message_item]);
-        if (refBody) parts.push(refBody);
-      }
-      return parts.length ? `[引用: ${parts.join(" | ")}]\n${text}` : text;
+export function extractOwnText(itemList = []) {
+  return itemList.map(item => item.text_item?.text ?? item.voice_item?.text ?? "").filter(Boolean).join("\n");
+}
+export function extractText(itemList = []) {
+  const own = extractOwnText(itemList);
+  const quotes = itemList.flatMap(item => {
+    const ref = item.ref_msg;
+    if (!ref) return [];
+    const body = ref.message_item ? extractOwnText([ref.message_item]) : "";
+    return [ref.title, body].filter(Boolean).join(" | ") || [];
+  });
+  return [...quotes.map(body => '[引用: ' + body + ']'), own].filter(Boolean).join("\n");
+}
+export function parseInbound(msg, accountId, quoteStore) {
+  const commandText = extractOwnText(msg.item_list);
+  const conversationId = msg.group_id || msg.from_user_id || "";
+  const quotes = [];
+  let quotedMedia;
+  for (const item of msg.item_list ?? []) {
+    const ref = item.ref_msg;
+    if (!ref) continue;
+    const cached = ref.svr_id ? quoteStore?.find(accountId, conversationId, String(ref.svr_id)) : undefined;
+    let body = ref.message_item ? extractOwnText([ref.message_item]) : cached?.body;
+    let partialFallback = false;
+    if (body && ref.partial_text) {
+      const partial = resolvePartialQuote(body, ref.partial_text);
+      body = partial.resolved || body; partialFallback = partial.fallback;
     }
-    // 语音转文字
-    if (item.type === MessageItemType.VOICE && item.voice_item?.text) {
-      return item.voice_item.text;
-    }
+    quotes.push({ title: ref.title, body: body || "", serverMessageId: ref.svr_id, partialFallback, mediaPath: cached?.mediaPath, mediaMime: cached?.mediaMime, mediaName: cached?.mediaName });
+    if (isMediaItem(ref.message_item)) quotedMedia = ref.message_item;
   }
-  return "";
-}
-
-/**
- * 将原始 WeixinMessage 解析为统一的结构化入站消息。
- *
- * @returns {InboundMessage}
- */
-export function parseInbound(msg, accountId) {
-  const text = extractText(msg.item_list);
-  const result = {
-    raw: msg,
-    accountId,
-    fromUserId: msg.from_user_id ?? "",
-    toUserId: msg.to_user_id ?? "",
-    contextToken: msg.context_token,
-    messageId: msg.message_id,
-    seq: msg.seq,
-    createTimeMs: msg.create_time_ms,
-    sessionId: msg.session_id,
-    groupId: msg.group_id,
-    messageType: msg.message_type,
-    messageState: msg.message_state,
-    text,
-    /** 入站媒体 item（首个媒体项，优先级 IMAGE > VIDEO > FILE > VOICE） */
-    mediaItem: findFirstMediaItem(msg.item_list),
-    /** 所有 item 的类型列表 */
-    itemTypes: (msg.item_list ?? []).map((i) => i.type),
+  const quoteContext = quotes.map(q => [q.title, q.body].filter(Boolean).join(" | ")).filter(Boolean).map(body => '[引用: ' + body + ']').join("\n");
+  return { raw: msg, accountId, fromUserId: msg.from_user_id ?? "", toUserId: msg.to_user_id ?? "",
+    contextToken: msg.context_token, messageId: msg.message_id, seq: msg.seq, createTimeMs: msg.create_time_ms,
+    sessionId: msg.session_id, groupId: msg.group_id, runId: msg.run_id,
+    messageType: msg.message_type, messageState: msg.message_state,
+    commandText, quoteContext, quotes, text: [quoteContext, commandText].filter(Boolean).join("\n"),
+    mediaItem: findFirstMediaItem(msg.item_list) || quotedMedia || null,
+    itemTypes: (msg.item_list ?? []).map(i => i.type),
   };
-  return result;
 }
-
-function findFirstMediaItem(itemList) {
-  if (!itemList?.length) return null;
-  const byType = (type) => itemList.find((i) => i.type === type && i.image_item?.media?.encrypt_query_param
-    || i.type === type && i.video_item?.media?.encrypt_query_param
-    || i.type === type && i.file_item?.media?.encrypt_query_param
-    || i.type === type && i.voice_item?.media?.encrypt_query_param);
-  return byType(MessageItemType.IMAGE)
-    ?? byType(MessageItemType.VIDEO)
-    ?? byType(MessageItemType.FILE)
-    ?? byType(MessageItemType.VOICE)
-    ?? null;
+function findFirstMediaItem(itemList = []) {
+  return [MessageItemType.IMAGE, MessageItemType.VIDEO, MessageItemType.FILE, MessageItemType.VOICE]
+    .map(type => itemList.find(item => item.type === type && [item.image_item, item.video_item, item.file_item, item.voice_item].some(value => value?.media?.encrypt_query_param || value?.media?.full_url)))
+    .find(Boolean) || null;
 }

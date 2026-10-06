@@ -39,3 +39,19 @@ export function installProcessGuards() {
     });
   });
 }
+
+/** Notify iLink and release task admission before a service stop. */
+export function installGracefulShutdown(bot, { close, timeoutMs = 8000 } = {}) {
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const timeout = setTimeout(() => process.exit(0), timeoutMs);
+    try { await Promise.all([bot.stop(), close?.()]); }
+    catch (err) { log.warn("shutdown cleanup failed", { err: err.name }); }
+    finally { clearTimeout(timeout); process.exit(0); }
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+  return () => { process.off("SIGTERM", shutdown); process.off("SIGINT", shutdown); };
+}

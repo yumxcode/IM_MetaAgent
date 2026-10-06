@@ -61,8 +61,14 @@ export function redactToken(token, prefixLen = 6) {
 
 export function redactBody(body, maxLen = 200) {
   if (!body) return "(empty)";
-  if (body.length <= maxLen) return body;
-  return `${body.slice(0, maxLen)}…(truncated, totalLen=${body.length})`;
+  const sensitive = /^(?:token|bot_token|context_token|typing_ticket|aes_key|aeskey|qrcode|qrcode_img_content|local_token_list|verify_code|upload_param|upload_full_url|encrypt_query_param|encrypted_query_param|full_url)$/i;
+  let safe;
+  try {
+    safe = JSON.stringify(JSON.parse(String(body)), (key, value) => sensitive.test(key) ? "<redacted>" : value);
+  } catch {
+    safe = String(body).replace(/("(?:bot_token|token|context_token|typing_ticket|aes_key|aeskey|qrcode|verify_code|upload_param|encrypt_query_param)"\s*:\s*)"(?:\\.|[^"\\])*"/gi, '$1"<redacted>"');
+  }
+  return safe.length <= maxLen ? safe : `${safe.slice(0, maxLen)}…(truncated, totalLen=${safe.length})`;
 }
 
 export function redactUrl(rawUrl) {
@@ -172,11 +178,17 @@ export function removeFile(filePath) {
 /** sleep，可被 AbortSignal 中断。 */
 export function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
+    const abort = () => {
       clearTimeout(t);
+      signal?.removeEventListener("abort", abort);
       reject(new Error("aborted"));
-    }, { once: true });
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    if (signal?.aborted) return abort();
+    signal?.addEventListener("abort", abort, { once: true });
   });
 }
 
@@ -190,7 +202,7 @@ export function ensureTrailingSlash(url) {
  * 与官方插件的 normalizeAccountId 行为一致，便于共享状态目录。
  */
 export function normalizeAccountId(id) {
-  return String(id || "").trim().replace(/[@:]/g, "-");
+  return String(id || "").trim().replace(/[@:]/g, "-").replace(/[\\/\u0000]/g, "_").replace(/\.\./g, "_");
 }
 
 /** 判断字符串是否为本地文件路径（无 URL scheme）。 */

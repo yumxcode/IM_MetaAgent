@@ -1,0 +1,14 @@
+[
+  {
+    "name": "@tencent-weixin/openclaw-weixin",
+    "version": "2.4.9",
+    "integrity": "sha512-SfaYehR1Cwq2VV5HxJBp9sVilMms420VfZlMbF4YjRbWomr5+GxfXp9HkeU6y5TbnOc4Ysq0qPw1yBvJwbenBA==",
+    "tarball": "https://registry.npmjs.org/@tencent-weixin/openclaw-weixin/-/openclaw-weixin-2.4.9.tgz"
+  },
+  {
+    "name": "@tencent-weixin/openclaw-weixin-cli",
+    "version": "2.1.4",
+    "integrity": "sha512-+hHCsfLqwFSd4pPyB9tp++/agWFrWZeRNj/Zy4FZDd1N7BlYoQA0FOLen/wbv3liM+CVZYGCXgDA5kvpF7prEg==",
+    "tarball": "https://registry.npmjs.org/@tencent-weixin/openclaw-weixin-cli/-/openclaw-weixin-cli-2.1.4.tgz"
+  }
+]

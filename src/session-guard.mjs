@@ -15,13 +15,13 @@ import { log } from "./util.mjs";
 const pauseUntilMap = new Map();
 
 /** 暂停某账号的所有请求 1 小时。 */
-export function pauseSession(accountId) {
-  const until = Date.now() + SESSION_PAUSE_DURATION_MS;
+export function pauseSession(accountId, { durationMs = SESSION_PAUSE_DURATION_MS } = {}) {
+  const until = Date.now() + durationMs;
   pauseUntilMap.set(accountId, until);
   log.info(`session-guard: paused`, {
     accountId,
     until: new Date(until).toISOString(),
-    minutes: SESSION_PAUSE_DURATION_MS / 60_000,
+    minutes: durationMs / 60_000,
   });
 }
 
@@ -62,3 +62,17 @@ export function assertSessionActive(accountId) {
 export function _resetSessionGuardForTest() {
   pauseUntilMap.clear();
 }
+
+/** A newly authenticated token can immediately end the old token's cooldown. */
+export function clearSessionPause(accountId) {
+  pauseUntilMap.delete(accountId);
+}
+
+// Preserve session terminology for existing users and official stale-token names
+// for clients ported from the new protocol documentation.
+export { SESSION_EXPIRED_ERRCODE as STALE_TOKEN_ERRCODE } from "./constants.mjs";
+export const pauseStaleToken = pauseSession;
+export const isStaleTokenPaused = isSessionPaused;
+export const getRemainingStaleTokenPauseMs = getRemainingPauseMs;
+export const assertTokenNotStale = assertSessionActive;
+export const _resetForTest = _resetSessionGuardForTest;

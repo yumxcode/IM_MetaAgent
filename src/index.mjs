@@ -2,7 +2,7 @@
  * WeixinBot —— 完备的微信 iLink Bot 接入层主类
  *
  * 设计目标：
- *  - 零框架依赖（仅依赖 Node.js >= 18 的内置 fetch / crypto）
+ *  - 零框架依赖（仅依赖 Node.js >= 22.13 的内置 fetch / crypto）
  *  - 事件驱动：bot.on('message' | 'media' | 'image' | 'voice' | 'file' | 'video' | 'error' | 'session-expired')
  *  - Promise 化：bot.sendText(...), bot.sendMedia(...)
  *  - 多账号：login(accountId?) / start(accountId?) / 多账号并存
@@ -18,6 +18,7 @@
  *   await bot.start();              // 开始长轮询（阻塞）
  */
 import os from "node:os";
+import fs from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -26,7 +27,8 @@ import {
   MessageItemType,
   MessageType,
 } from "./constants.mjs";
-import { WeixinApiError } from "./http.mjs";
+import { notifyStart, notifyStop } from "./http.mjs";
+import { QuoteStore, resolveQuoteCachePolicy, resolveQuoteMediaDirectory, deleteQuoteCacheForAccount } from "./quote-store.mjs";
 import {
   login as authLogin,
   resolveAccount,
@@ -45,17 +47,20 @@ import {
   sendImage as _sendImage,
   sendVideo as _sendVideo,
   sendFile as _sendFile,
+  sendVoice as _sendVoice,
+  sendToolProgress as _sendToolProgress,
   createReplyStream as _createReplyStream,
   parseInbound,
   extractText,
   isMediaItem,
   setContextToken,
   getContextToken,
+  clearContextTokens,
 } from "./messaging.mjs";
-import { uploadLocalFile, downloadAndDecryptBuffer, saveBufferToFile } from "./media.mjs";
+import { uploadLocalFile, uploadImage, uploadVideo, uploadVoice, uploadFileAttachment, downloadAndDecryptBuffer, downloadPlainCdnBuffer, saveBufferToFile } from "./media.mjs";
 import { TypingTicketManager, createTypingController } from "./typing.mjs";
 import { startPolling } from "./poller.mjs";
-import { isSessionPaused, assertSessionActive } from "./session-guard.mjs";
+import { isSessionPaused, assertSessionActive, clearSessionPause } from "./session-guard.mjs";
 import { log, generateId } from "./util.mjs";
 
 /**
@@ -114,14 +119,21 @@ class WeixinBot {
    */
   constructor(opts = {}) {
     this.baseUrl = opts.baseUrl || DEFAULT_BASE_URL;
+    this._baseUrlOverride = opts.baseUrl;
     this.cdnBaseUrl = opts.cdnBaseUrl || CDN_BASE_URL;
     this.routeTag = opts.routeTag;
-    this.inboundMediaDir = opts.inboundMediaDir || defaultInboundMediaDir();
+    this.inboundMediaDir = opts.inboundMediaDir;
     this.autoDownloadMedia = opts.autoDownloadMedia !== false;
 
     this._emitter = createEmitter();
     this._typingManagers = new Map(); // accountId -> TypingTicketManager
-    this._pollingAbort = null;
+    this._polling = new Map();
+    this._pollingFn = opts.pollingFn || startPolling;
+    this._notifyStart = opts.notifyStartFn || notifyStart;
+    this._notifyStop = opts.notifyStopFn || notifyStop;
+    this._quotePolicy = resolveQuoteCachePolicy({ channels: { "openclaw-weixin": { quoteCache: opts.quoteCache ?? { enabled: process.env.WEIXIN_QUOTE_CACHE_ENABLED !== "false" } } } });
+    this._quoteStore = null;
+    this._quoteOpen = null;
     this._defaultAccountId = null;
   }
 
@@ -157,7 +169,12 @@ class WeixinBot {
 
   /** 获取默认账号（首个已登录账号或显式设置值）。 */
   getDefaultAccount() {
-    return this._defaultAccountId ?? this.listAccounts()[0];
+    if (this._defaultAccountId) return this._defaultAccountId;
+    if (process.env.WEIXIN_ACCOUNT_ID?.trim()) return process.env.WEIXIN_ACCOUNT_ID.trim();
+    return this.listAccounts().map(id => ({ id, data: loadAccount(id) }))
+      .filter(account => account.data?.token)
+      .sort((a, b) => (Date.parse(b.data.savedAt) || 0) - (Date.parse(a.data.savedAt) || 0))[0]?.id;
+
   }
 
   /**
@@ -170,7 +187,7 @@ class WeixinBot {
     }
     return resolveAccount({
       accountId: id,
-      baseUrl: this.baseUrl,
+      baseUrl: this._baseUrlOverride,
       cdnBaseUrl: this.cdnBaseUrl,
     });
   }
@@ -193,7 +210,11 @@ class WeixinBot {
       routeTag: this.routeTag,
       ...opts,
     });
-    this.setDefaultAccount(result.accountId);
+    if (result.connected !== false && result.accountId) {
+      this.setDefaultAccount(result.accountId);
+      clearSessionPause(result.accountId);
+      this._typingManagers.delete(result.accountId);
+    }
     return result;
   }
 
@@ -214,7 +235,7 @@ class WeixinBot {
       routeTag: this.routeTag,
       ...opts,
     });
-    if (result.connected) this.setDefaultAccount(result.accountId);
+    if (result.connected) { this.setDefaultAccount(result.accountId); clearSessionPause(result.accountId); this._typingManagers.delete(result.accountId); }
     return result;
   }
 
@@ -222,7 +243,11 @@ class WeixinBot {
   async logout(accountId) {
     const id = accountId || this.getDefaultAccount();
     if (!id) return;
+    await this.stop(id);
     deleteAccount(id);
+    clearContextTokens(id);
+    if (this._quoteStore) this._quoteStore.deleteAccount(id);
+    else deleteQuoteCacheForAccount(id);
     this._typingManagers.delete(id);
     log.info(`logged out`, { accountId: id });
   }
@@ -245,61 +270,76 @@ class WeixinBot {
    */
   async start(opts = {}) {
     const accountId = opts.accountId || this.getDefaultAccount();
-    if (!accountId) {
-      throw new Error("no account to poll: please login first");
-    }
+    if (!accountId) throw new Error("no account to poll: please login first");
     const account = this._account(accountId);
-    if (!account.configured) {
-      throw new Error(`account ${accountId} not configured (no token). Run login() first.`);
-    }
-
-    // 若已有正在运行的轮询，先停掉
-    this.stop(accountId);
-
+    if (!account.configured) throw new Error(`account ${accountId} has no token`);
+    await this.stop(accountId);
+    await this._ensureQuoteStore();
     const controller = new AbortController();
-    if (opts.signal) {
-      opts.signal.addEventListener("abort", () => controller.abort(), { once: true });
+    const externalAbort = () => controller.abort();
+    if (opts.signal?.aborted) controller.abort();
+    else opts.signal?.addEventListener("abort", externalAbort, { once: true });
+    let done;
+    const state = { controller, done: new Promise(resolve => { done = resolve; }) };
+    this._polling.set(accountId, state);
+    try {
+      if (controller.signal.aborted) return;
+      await this._notifyStart({ baseUrl: account.baseUrl, token: account.token, routeTag: this.routeTag, timeoutMs: 3000, signal: controller.signal }).catch(err => log.warn("notifyStart failed", { err: err.name }));
+      log.info("WeixinBot polling started", { accountId, baseUrl: account.baseUrl });
+      await this._pollingFn({
+        baseUrl: account.baseUrl, token: account.token, accountId, routeTag: this.routeTag,
+        loadSyncBuf: () => loadSyncBuf(accountId), saveSyncBuf: buf => saveSyncBuf(accountId, buf),
+        abortSignal: controller.signal,
+        reloadCredentials: () => { const fresh = this._account(accountId); return { token: fresh.token, baseUrl: fresh.baseUrl }; },
+        onMessage: (raw, id) => this._handleInbound(raw, id),
+        onError: async err => {
+          await this._emitter.emit("error", err);
+          if (err.errcode === -14 || err.ret === -14 || err.isStaleToken || err.message?.includes("session expired")) await this._emitter.emit("session-expired", accountId);
+        },
+      });
+    } finally {
+      opts.signal?.removeEventListener("abort", externalAbort);
+      try {
+        let fresh = account;
+        try { const reloaded = this._account(accountId); if (reloaded.configured) fresh = reloaded; } catch {}
+        await this._notifyStop({ baseUrl: fresh.baseUrl, token: fresh.token, routeTag: this.routeTag, timeoutMs: 3000 }).catch(err => log.warn("notifyStop failed", { err: err.name }));
+      } finally {
+        if (this._polling.get(accountId) === state) this._polling.delete(accountId);
+        done();
+      }
     }
-    this._pollingAbort = controller;
-
-    const aLog = (level, msg, meta) => log[level](`[${accountId}] ${msg}`, meta);
-    aLog("info", `WeixinBot polling started`, { baseUrl: account.baseUrl });
-
-    await startPolling({
-      baseUrl: account.baseUrl,
-      token: account.token,
-      accountId,
-      routeTag: this.routeTag,
-      loadSyncBuf: () => loadSyncBuf(accountId),
-      saveSyncBuf: (buf) => saveSyncBuf(accountId, buf),
-      abortSignal: controller.signal,
-      // session 暂停恢复后重新读取凭据（用户可能在另一终端 --login 刷新了 token）
-      reloadCredentials: () => {
-        const fresh = this._account(accountId);
-        return { token: fresh.token, baseUrl: fresh.baseUrl };
-      },
-      onMessage: async (rawMsg, aid) => {
-        await this._handleInbound(rawMsg, aid);
-      },
-      onError: async (err) => {
-        await this._emitter.emit("error", err);
-        if (err.message?.includes("session expired")) {
-          await this._emitter.emit("session-expired", accountId);
-        }
-      },
-    });
   }
 
-  /**
-   * 停止长轮询。
-   * @param {string} [accountId] - 不传则停所有
-   */
-  stop(accountId) {
-    if (this._pollingAbort) {
-      this._pollingAbort.abort();
-      this._pollingAbort = null;
-      log.info(`polling stop signal sent`, { accountId: accountId ?? "(all)" });
+  async stop(accountId) {
+    const states = accountId ? [this._polling.get(accountId)].filter(Boolean) : [...this._polling.values()];
+    for (const state of states) state.controller.abort();
+    await Promise.all(states.map(state => state.done));
+    if (!accountId) {
+      this._quoteStore?.close(); this._quoteStore = null; this._quoteOpen = null;
+      this._typingManagers.clear();
     }
+  }
+
+  async _ensureQuoteStore() {
+    if (!this._quoteOpen) this._quoteOpen = QuoteStore.open({ policy: this._quotePolicy }).then(store => (this._quoteStore = store));
+    return this._quoteOpen;
+  }
+
+  async _cacheSent(acc, to, record) {
+    if (!record.serverMessageId) return;
+    try {
+      const store = await this._ensureQuoteStore();
+      if (!store) return;
+      let sourceMediaPath, mediaMime;
+      if (record.sourceMediaPath && (await fs.stat(record.sourceMediaPath)).size <= store.policy.maxSingleMediaBytes) {
+        const dir = resolveQuoteMediaDirectory(acc.accountId);
+        await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+        sourceMediaPath = path.join(dir, generateId("sent") + path.extname(record.sourceMediaPath));
+        await fs.copyFile(record.sourceMediaPath, sourceMediaPath);
+        mediaMime = (await import("./mime.mjs")).getMimeFromFilename(record.sourceMediaPath);
+      }
+      await store.put({ accountId: acc.accountId, conversationId: to, messageId: String(record.serverMessageId), direction: "outbound", body: record.body || "", sourceMediaPath, mediaMime, mediaName: record.mediaName });
+    } catch (err) { log.warn("outbound quote cache failed", { err: err.name }); }
   }
 
   /**
@@ -315,7 +355,13 @@ class WeixinBot {
       return;
     }
 
-    const msg = parseInbound(rawMsg, accountId);
+    const msg = parseInbound(rawMsg, accountId, await this._ensureQuoteStore());
+    const cachedMedia = msg.quotes.find(q => q.mediaPath);
+    if (!msg.mediaItem && cachedMedia) {
+      if (await fs.stat(cachedMedia.mediaPath).then(stat => stat.isFile()).catch(() => false)) {
+        msg.mediaPath = cachedMedia.mediaPath; msg.mediaType = cachedMedia.mediaMime; msg.fileName = cachedMedia.mediaName;
+      }
+    }
 
     // 记录 contextToken 供出站使用
     if (msg.contextToken && msg.fromUserId) {
@@ -332,6 +378,10 @@ class WeixinBot {
       }
     }
 
+    if (msg.messageId && this._quoteStore) {
+      try { await this._quoteStore.put({ accountId, conversationId: msg.groupId || msg.fromUserId, messageId: String(msg.messageId), direction: "inbound", body: msg.commandText, sourceMediaPath: msg.mediaPath, mediaMime: msg.mediaType, mediaName: msg.fileName }); }
+      catch (err) { log.warn("inbound quote cache failed", { err: err.name }); }
+    }
     // 按类型分发
     await this._emitter.emit("message", msg);
     if (msg.mediaPath) {
@@ -350,56 +400,33 @@ class WeixinBot {
    */
   async _downloadInboundMedia(msg) {
     const item = msg.mediaItem;
-    if (!item) return;
-    const label = `inbound[${msg.fromUserId}]`;
-
-    if (item.type === MessageItemType.IMAGE) {
-      const img = item.image_item;
-      if (!img?.media?.encrypt_query_param) return;
-      const aesKeyBase64 = img.aeskey
-        ? Buffer.from(img.aeskey, "hex").toString("base64")
-        : img.media.aes_key;
-      const buf = aesKeyBase64
-        ? await downloadAndDecryptBuffer(img.media.encrypt_query_param, aesKeyBase64, this.cdnBaseUrl, `${label} image`)
-        : await import("./media.mjs").then(m => m.downloadPlainCdnBuffer(img.media.encrypt_query_param, this.cdnBaseUrl, `${label} image`));
-      msg.mediaPath = await saveBufferToFile(buf, this.inboundMediaDir, { ext: ".jpg", prefix: "wx-img" });
-      msg.mediaType = "image/jpeg";
-      msg.mediaBuffer = buf;
-    } else if (item.type === MessageItemType.VOICE) {
-      const voice = item.voice_item;
-      if (!voice?.media?.encrypt_query_param || !voice.media.aes_key) return;
-      const silkBuf = await downloadAndDecryptBuffer(voice.media.encrypt_query_param, voice.media.aes_key, this.cdnBaseUrl, `${label} voice`);
-      const { silkToWav } = await import("./media.mjs");
-      const wav = await silkToWav(silkBuf);
-      if (wav) {
-        msg.mediaPath = await saveBufferToFile(wav, this.inboundMediaDir, { ext: ".wav", prefix: "wx-voice" });
-        msg.mediaType = "audio/wav";
-        msg.mediaBuffer = wav;
-      } else {
-        msg.mediaPath = await saveBufferToFile(silkBuf, this.inboundMediaDir, { ext: ".silk", prefix: "wx-voice" });
-        msg.mediaType = "audio/silk";
-        msg.mediaBuffer = silkBuf;
-      }
-      // 语音转文字
-      if (voice.text) msg.voiceText = voice.text;
-    } else if (item.type === MessageItemType.FILE) {
-      const f = item.file_item;
-      if (!f?.media?.encrypt_query_param || !f.media.aes_key) return;
-      const buf = await downloadAndDecryptBuffer(f.media.encrypt_query_param, f.media.aes_key, this.cdnBaseUrl, `${label} file`);
-      const ext = f.file_name ? path.extname(f.file_name) || ".bin" : ".bin";
-      msg.mediaPath = await saveBufferToFile(buf, this.inboundMediaDir, { ext, prefix: "wx-file", originalFilename: f.file_name });
-      const { getMimeFromFilename } = await import("./mime.mjs");
-      msg.mediaType = getMimeFromFilename(f.file_name ?? "file.bin");
-      msg.fileName = f.file_name;
-      msg.mediaBuffer = buf;
-    } else if (item.type === MessageItemType.VIDEO) {
-      const v = item.video_item;
-      if (!v?.media?.encrypt_query_param || !v.media.aes_key) return;
-      const buf = await downloadAndDecryptBuffer(v.media.encrypt_query_param, v.media.aes_key, this.cdnBaseUrl, `${label} video`);
-      msg.mediaPath = await saveBufferToFile(buf, this.inboundMediaDir, { ext: ".mp4", prefix: "wx-video" });
-      msg.mediaType = "video/mp4";
-      msg.mediaBuffer = buf;
+    const value = item?.image_item || item?.voice_item || item?.file_item || item?.video_item;
+    if (!value?.media) return;
+    const media = { ...value.media };
+    if (value.aeskey) media.aes_key = Buffer.from(value.aeskey).toString("base64");
+    const options = { cdnBaseUrl: this.cdnBaseUrl, label: "inbound media", timeoutMs: 30000, signal: this._polling.get(msg.accountId)?.controller.signal };
+    let buf = media.aes_key ? await downloadAndDecryptBuffer(media, options) : await downloadPlainCdnBuffer(media, options);
+    let ext = ".bin", mime = "application/octet-stream";
+    if (item.type === MessageItemType.IMAGE) { ext = ".jpg"; mime = "image/jpeg"; }
+    if (item.type === MessageItemType.VIDEO) { ext = ".mp4"; mime = "video/mp4"; }
+    if (item.type === MessageItemType.FILE) {
+      ext = path.extname(value.file_name || "") || ".bin";
+      mime = (await import("./mime.mjs")).getMimeFromFilename(value.file_name || "file.bin"); msg.fileName = value.file_name;
     }
+    if (item.type === MessageItemType.VOICE) {
+      const code = value.encode_type ?? 6;
+      ext = code === 7 ? ".mp3" : code === 8 ? ".ogg" : code === 1 ? ".pcm" : ".silk";
+      mime = code === 7 ? "audio/mpeg" : code === 8 ? "audio/ogg" : code === 1 ? "audio/pcm" : "audio/silk";
+      if (code === 6) {
+        const wav = await (await import("./media.mjs")).silkToWav(buf);
+        if (wav) { buf = wav; ext = ".wav"; mime = "audio/wav"; }
+      }
+      if (value.text) msg.voiceText = value.text;
+    }
+    const cacheable = this._quoteStore && buf.length <= this._quoteStore.policy.maxSingleMediaBytes;
+    const dir = this.inboundMediaDir || (cacheable ? resolveQuoteMediaDirectory(msg.accountId) : defaultInboundMediaDir());
+    msg.mediaPath = await saveBufferToFile(buf, dir, { ext, prefix: "wx-media", originalFilename: value.file_name });
+    msg.mediaType = mime; msg.mediaBuffer = buf;
   }
 
   // ------------------------------------------------------------------
@@ -410,7 +437,7 @@ class WeixinBot {
    * 发送纯文本。
    * contextToken 缺省时自动从内存缓存取（基于 accountId + to）。
    */
-  async sendText({ to, text, contextToken, accountId, timeoutMs } = {}) {
+  async sendText({ to, text, contextToken, accountId, timeoutMs, runId, signal } = {}) {
     const acc = this._account(accountId);
     assertSessionActive(acc.accountId);
     const ctx = contextToken ?? getContextToken(acc.accountId, to);
@@ -420,7 +447,7 @@ class WeixinBot {
       to,
       text,
       contextToken: ctx,
-      timeoutMs,
+      timeoutMs, runId, signal, onSent: record => this._cacheSent(acc, to, record),
       routeTag: this.routeTag,
     });
   }
@@ -428,7 +455,7 @@ class WeixinBot {
   /**
    * 发送媒体文件（本地路径或 http(s) URL），按 MIME 自动路由。
    */
-  async sendMedia({ to, mediaUrl, text = "", contextToken, accountId, timeoutMs, destDir } = {}) {
+  async sendMedia({ to, mediaUrl, text = "", contextToken, accountId, timeoutMs, destDir, runId, signal } = {}) {
     const acc = this._account(accountId);
     assertSessionActive(acc.accountId);
     const ctx = contextToken ?? getContextToken(acc.accountId, to);
@@ -439,45 +466,38 @@ class WeixinBot {
       mediaUrl,
       text,
       contextToken: ctx,
-      timeoutMs,
+      timeoutMs, runId, signal, onSent: record => this._cacheSent(acc, to, record),
       routeTag: this.routeTag,
       cdnBaseUrl: this.cdnBaseUrl,
       destDir,
     });
   }
 
-  /** 发送本地图片。 */
-  async sendImageFile({ to, filePath, text = "", contextToken, accountId, timeoutMs } = {}) {
-    return this._sendUploadedMedia({ to, filePath, text, contextToken, accountId, timeoutMs, kind: "image" });
-  }
-
-  /** 发送本地视频。 */
-  async sendVideoFile({ to, filePath, text = "", contextToken, accountId, timeoutMs } = {}) {
-    return this._sendUploadedMedia({ to, filePath, text, contextToken, accountId, timeoutMs, kind: "video" });
-  }
-
-  /** 发送本地文件附件。 */
-  async sendFileAttachment({ to, filePath, text = "", contextToken, accountId, timeoutMs } = {}) {
-    return this._sendUploadedMedia({ to, filePath, text, contextToken, accountId, timeoutMs, kind: "file" });
-  }
-
-  async _sendUploadedMedia({ to, filePath, text, contextToken, accountId, timeoutMs, kind }) {
+  sendImageFile(opts = {}) { return this._sendUploadedMedia({ ...opts, kind: "image" }); }
+  sendVideoFile(opts = {}) { return this._sendUploadedMedia({ ...opts, kind: "video" }); }
+  sendFileAttachment(opts = {}) { return this._sendUploadedMedia({ ...opts, kind: "file" }); }
+  sendVoiceFile(opts = {}) { return this._sendUploadedMedia({ ...opts, kind: "voice" }); }
+  async _sendUploadedMedia({ to, filePath, text, contextToken, accountId, timeoutMs, kind, runId, signal, sampleRate, playtime }) {
     const acc = this._account(accountId);
     assertSessionActive(acc.accountId);
     const ctx = contextToken ?? getContextToken(acc.accountId, to);
-    const uploadOpts = { baseUrl: acc.baseUrl, token: acc.token, routeTag: this.routeTag };
-    const uploaded = await uploadLocalFile({ filePath, toUserId: to, opts: uploadOpts, cdnBaseUrl: this.cdnBaseUrl });
-    const sendArgs = { baseUrl: acc.baseUrl, token: acc.token, to, text, uploaded, contextToken: ctx, timeoutMs, routeTag: this.routeTag };
-    if (kind === "image") return _sendImage(sendArgs);
-    if (kind === "video") return _sendVideo(sendArgs);
-    return _sendFile({ ...sendArgs, fileName: path.basename(filePath) });
+    const opts = { baseUrl: acc.baseUrl, token: acc.token, routeTag: this.routeTag, timeoutMs, signal };
+    const uploader = { image: uploadImage, video: uploadVideo, voice: uploadVoice, file: uploadFileAttachment }[kind];
+    const uploaded = await uploader({ filePath, toUserId: to, opts, cdnBaseUrl: this.cdnBaseUrl });
+    const sendArgs = { ...opts, to, text, uploaded, contextToken: ctx, runId, sampleRate, playtime, sourceMediaPath: filePath, onSent: record => this._cacheSent(acc, to, record) };
+    const sender = { image: _sendImage, video: _sendVideo, voice: _sendVoice, file: _sendFile }[kind];
+    return sender({ ...sendArgs, fileName: path.basename(filePath) });
+  }
+  async sendToolProgress({ accountId, to, contextToken, ...opts } = {}) {
+    const acc = this._account(accountId); assertSessionActive(acc.accountId);
+    return _sendToolProgress({ ...opts, to, contextToken: contextToken ?? getContextToken(acc.accountId, to), baseUrl: acc.baseUrl, token: acc.token, routeTag: this.routeTag });
   }
 
   /**
    * 创建流式回复会话。
    * push(chunk): 发送 GENERATING 状态的增量；finish(fullText): 发送 FINISH 的最终消息。
    */
-  createReplyStream({ to, contextToken, accountId, timeoutMs } = {}) {
+  createReplyStream({ to, contextToken, accountId, timeoutMs, runId, signal } = {}) {
     const acc = this._account(accountId);
     assertSessionActive(acc.accountId);
     const ctx = contextToken ?? getContextToken(acc.accountId, to);
@@ -486,7 +506,7 @@ class WeixinBot {
       token: acc.token,
       to,
       contextToken: ctx,
-      timeoutMs,
+      timeoutMs, runId, signal, onSent: record => this._cacheSent(acc, to, record),
       routeTag: this.routeTag,
     });
   }
@@ -500,6 +520,7 @@ class WeixinBot {
       text,
       contextToken: inboundMsg.contextToken,
       accountId: accountId || inboundMsg.accountId,
+      runId: inboundMsg.runId,
     });
   }
 
@@ -513,6 +534,7 @@ class WeixinBot {
       text,
       contextToken: inboundMsg.contextToken,
       accountId: accountId || inboundMsg.accountId,
+      runId: inboundMsg.runId,
     });
   }
 
@@ -523,8 +545,9 @@ class WeixinBot {
   _typingManager(accountId) {
     const acc = this._account(accountId);
     let mgr = this._typingManagers.get(acc.accountId);
-    if (!mgr) {
+    if (!mgr || mgr._credentialKey !== acc.token + acc.baseUrl) {
       mgr = new TypingTicketManager({ baseUrl: acc.baseUrl, token: acc.token, routeTag: this.routeTag });
+      mgr._credentialKey = acc.token + acc.baseUrl;
       this._typingManagers.set(acc.accountId, mgr);
     }
     return mgr;
@@ -593,6 +616,9 @@ export {
   getConfig,
   sendTyping,
   buildHeaders,
+  notifyStart,
+  notifyStop,
+  buildAppHeaders,
   buildBaseInfo,
 } from "./http.mjs";
 export {
@@ -617,6 +643,7 @@ export {
   uploadLocalFile,
   uploadImage,
   uploadVideo,
+  uploadVoice,
   uploadFileAttachment,
   uploadBuffer,
   uploadBufferToCdn,
@@ -635,6 +662,9 @@ export {
   sendMedia,
   sendImage,
   sendVideo,
+  sendVoice,
+  sendToolProgress,
+  buildVoiceItem,
   sendFile,
   createReplyStream,
   parseInbound,
@@ -654,6 +684,7 @@ export {
   isSessionPaused,
   getRemainingPauseMs,
   assertSessionActive,
+  clearSessionPause,
 } from "./session-guard.mjs";
 export {
   getMimeFromFilename,
@@ -671,4 +702,7 @@ export {
   sleep,
 } from "./util.mjs";
 
+export { QuoteStore, resolveQuoteCachePolicy } from "./quote-store.mjs";
+export { StreamingMarkdownFilter } from "./markdown-filter.mjs";
+export { resolvePartialQuote } from "./partial-quote.mjs";
 export default WeixinBot;

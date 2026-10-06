@@ -15,7 +15,14 @@ export const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 export const DEFAULT_BOT_TYPE = "3";
 
 /** 接入层版本号，用于 base_info.channel_version */
-export const CHANNEL_VERSION = "1.0.2";
+export const CHANNEL_VERSION = "2.4.9";
+
+/** 官方 iLink 客户端标识和版本编码（major<<16 | minor<<8 | patch）。 */
+export const ILINK_APP_ID = "bot";
+export const ILINK_APP_CLIENT_VERSION = (2 << 16) | (4 << 8) | 9;
+
+/** 本应用的上游身份；可用 WEIXIN_BOT_AGENT 覆盖。 */
+export const DEFAULT_BOT_AGENT = "IMMetaAgent/1.0.0";
 
 /** 长轮询默认超时（服务器最多 hold 35s） */
 export const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
@@ -28,6 +35,7 @@ export const DEFAULT_CONFIG_TIMEOUT_MS = 10_000;
 
 /** Session 过期错误码（服务器返回 errcode=-14 表示需要重新登录） */
 export const SESSION_EXPIRED_ERRCODE = -14;
+export const STALE_TOKEN_ERRCODE = SESSION_EXPIRED_ERRCODE;
 
 /** Session 过期后默认暂停时长（1 小时） */
 export const SESSION_PAUSE_DURATION_MS = 60 * 60 * 1000;
@@ -70,6 +78,8 @@ export const MessageItemType = Object.freeze({
   VOICE: 3,
   FILE: 4,
   VIDEO: 5,
+  TOOL_CALL_START: 11,
+  TOOL_CALL_RESULT: 12,
 });
 
 /**
@@ -109,6 +119,10 @@ export const QrCodeStatus = Object.freeze({
   SCANED: "scaned",
   CONFIRMED: "confirmed",
   EXPIRED: "expired",
+  SCANED_BUT_REDIRECT: "scaned_but_redirect",
+  NEED_VERIFYCODE: "need_verifycode",
+  VERIFY_CODE_BLOCKED: "verify_code_blocked",
+  BINDED_REDIRECT: "binded_redirect",
 });
 
 /**

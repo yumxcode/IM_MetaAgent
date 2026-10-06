@@ -11,6 +11,8 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { createInterface } from "node:readline/promises";
 
 import {
   ACTIVE_LOGIN_TTL_MS,
@@ -21,7 +23,7 @@ import {
   QR_LONG_POLL_TIMEOUT_MS,
   QrCodeStatus,
 } from "./constants.mjs";
-import { _apiGet as apiGet } from "./http.mjs";
+import { _apiGet as apiGet, _apiPost as apiPost } from "./http.mjs";
 import {
   ensureDir,
   log,
@@ -40,7 +42,7 @@ import {
 
 /**
  * 一次性自动迁移：旧目录名 openclaw-weixin → weixin-bot。
- * 启动时执行一次：旧存在且新不存在 → rename（原子操作，不丢数据）。
+ * 在启动及运行时解析目录：旧存在且新不存在 → rename（原子操作，不丢数据）。
  */
 function migrateLegacyStateDir() {
   const base = resolveStateDir();
@@ -58,9 +60,20 @@ function migrateLegacyStateDir() {
 migrateLegacyStateDir();
 
 function stateDir() {
+  migrateLegacyStateDir();
   const base = resolveStateDir();
   const newDir = path.join(base, "weixin-bot");
-  return fs.existsSync(newDir) ? newDir : path.join(base, "openclaw-weixin");
+  const oldDir = path.join(base, "openclaw-weixin");
+  // New installs must write to the canonical directory immediately. A later
+  // quote-cache initialization must not change where credentials are loaded.
+  return fs.existsSync(newDir) || !fs.existsSync(oldDir) ? newDir : oldDir;
+}
+function legacyPath(...parts) {
+  return path.join(resolveStateDir(), "openclaw-weixin", ...parts);
+}
+function readAccountIndex(filePath) {
+  const arr = readJson(filePath, []);
+  return Array.isArray(arr) ? arr.filter((id) => typeof id === "string" && id.trim()) : [];
 }
 function accountsDir() {
   return path.join(stateDir(), "accounts");
@@ -82,23 +95,31 @@ function syncBufFilePath(accountId) {
 
 /** 返回所有已注册的账号 ID。 */
 export function listAccountIds() {
-  const arr = readJson(accountIndexPath(), []);
-  return Array.isArray(arr) ? arr.filter((id) => typeof id === "string" && id.trim()) : [];
+  const primary = accountIndexPath();
+  const legacy = legacyPath("accounts.json");
+  return [...new Set([
+    ...(primary === legacy ? [] : readAccountIndex(legacy)),
+    ...readAccountIndex(primary),
+  ])];
 }
 
 /** 将账号 ID 加入索引（已存在则 no-op）。 */
 export function registerAccountId(accountId) {
   const existing = listAccountIds();
-  if (existing.includes(accountId)) return;
+  // If an account is still indexed only in a legacy directory, registering a
+  // canonical credential must also make its canonical index self-contained.
+  if (readAccountIndex(accountIndexPath()).includes(accountId)) return;
   ensureDir(stateDir());
-  writeJson(accountIndexPath(), [...existing, accountId], { mode: 0o644 });
+  writeJson(accountIndexPath(), existing.includes(accountId) ? existing : [...existing, accountId], { mode: 0o644 });
 }
 
 /** 从索引移除账号。 */
 export function unregisterAccountId(accountId) {
-  const existing = listAccountIds();
-  if (!existing.includes(accountId)) return;
-  writeJson(accountIndexPath(), existing.filter((id) => id !== accountId), { mode: 0o644 });
+  for (const indexPath of new Set([accountIndexPath(), legacyPath("accounts.json")])) {
+    const existing = readAccountIndex(indexPath);
+    const filtered = existing.filter((id) => normalizeAccountId(id) !== accountId);
+    if (filtered.length !== existing.length) writeJson(indexPath, filtered, { mode: 0o644 });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +138,7 @@ export function unregisterAccountId(accountId) {
 /** 加载账号凭据，不存在返回 null。 */
 export function loadAccount(accountId) {
   const id = normalizeAccountId(accountId);
-  return readJson(accountFilePath(id), null);
+  return readJson(accountFilePath(id), null) ?? readJson(legacyPath("accounts", `${id}.json`), null);
 }
 
 /** 保存账号凭据（合并写入）。 */
@@ -140,6 +161,9 @@ export function deleteAccount(accountId) {
   const id = normalizeAccountId(accountId);
   removeFile(accountFilePath(id));
   removeFile(syncBufFilePath(id));
+  // Both-directory compatibility must not resurrect a logged-out credential.
+  removeFile(legacyPath("accounts", `${id}.json`));
+  removeFile(legacyPath("accounts", `${id}.sync.json`));
   unregisterAccountId(id);
 }
 
@@ -169,7 +193,7 @@ export function resolveAccount({ accountId, token, baseUrl, cdnBaseUrl } = {}) {
 /** 加载持久化的 get_updates_buf，不存在返回 undefined。 */
 export function loadSyncBuf(accountId) {
   const id = normalizeAccountId(accountId);
-  const data = readJson(syncBufFilePath(id), null);
+  const data = readJson(syncBufFilePath(id), null) ?? readJson(legacyPath("accounts", `${id}.sync.json`), null);
   return data?.get_updates_buf;
 }
 
@@ -198,39 +222,111 @@ function purgeExpiredLogins() {
   }
 }
 
-async function fetchQRCode(apiBaseUrl, botType, routeTag) {
-  const base = apiBaseUrl.endsWith("/") ? apiBaseUrl : `${apiBaseUrl}/`;
-  const url = new URL(`ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(botType)}`, base);
-  log.info(`Fetching QR code`, { url: `(ilink)` });
-  const res = await fetch(url.toString(), { headers: routeTag ? { SKRouteTag: String(routeTag) } : {} });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "(unreadable)");
-    throw new Error(`Failed to fetch QR code: ${res.status} ${res.statusText} body=${body}`);
+const MAX_VERIFY_ATTEMPTS = 3;
+const MAX_LOGIN_REDIRECTS = 5;
+
+/** Credential-bearing redirects may only target Tencent's iLink HTTPS hosts. */
+function validateServerBaseUrl(value) {
+  if (typeof value !== "string" || !value.trim()) throw new Error("invalid login server URL");
+  const raw = value.trim();
+  const url = new URL(raw.includes("://") ? raw : `https://${raw}`);
+  if (url.protocol !== "https:" || url.username || url.password || url.port ||
+      url.search || url.hash || (url.pathname !== "/" && url.pathname !== "") ||
+      !(url.hostname === "ilinkai.weixin.qq.com" || /^ilink[a-z0-9-]*\.weixin\.qq\.com$/.test(url.hostname))) {
+    throw new Error("invalid login server URL");
   }
-  return res.json();
+  return url.origin;
 }
 
-async function pollQRStatus(apiBaseUrl, qrcode, routeTag) {
-  const base = apiBaseUrl.endsWith("/") ? apiBaseUrl : `${apiBaseUrl}/`;
-  const url = new URL(`ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`, base);
-  const headers = { "iLink-App-ClientVersion": "1" };
-  if (routeTag) headers.SKRouteTag = String(routeTag);
+/** Avoid including response bodies, tokens, QR identifiers, or pairing codes in errors. */
+function safeLoginError(err) {
+  if (Number.isInteger(err?.status)) return `微信接口返回 HTTP ${err.status}。`;
+  if (err?.name === "WeixinTimeoutError" || err?.name === "AbortError") return "请求超时或已取消。";
+  return "请求失败，请检查网络或重新登录。";
+}
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), QR_LONG_POLL_TIMEOUT_MS);
+function localAccountSnapshot() {
+  const entries = [];
+  const seen = new Set();
+  const ids = listAccountIds();
+  for (let i = ids.length - 1; i >= 0 && entries.length < 10; i--) {
+    const accountId = normalizeAccountId(ids[i]);
+    if (!/^[A-Za-z0-9_.-]+$/.test(accountId)) continue;
+    const data = loadAccount(accountId);
+    const token = typeof data?.token === "string" ? data.token.trim() : "";
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    entries.push({ ...data, accountId, token });
+  }
+  return entries;
+}
+
+async function fetchQRCode(apiBaseUrl, botType, routeTag, signal) {
+  const accounts = localAccountSnapshot();
+  const qr = await apiPost({
+    baseUrl: apiBaseUrl,
+    endpoint: `ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(botType)}`,
+    body: { local_token_list: accounts.map((account) => account.token) },
+    injectBaseInfo: false,
+    allowApiError: true,
+    label: "fetchQRCode",
+    routeTag,
+    signal,
+  });
+  if ((qr.ret !== undefined && qr.ret !== 0) || (qr.errcode !== undefined && qr.errcode !== 0) ||
+      typeof qr.qrcode !== "string" || !qr.qrcode.trim() ||
+      typeof qr.qrcode_img_content !== "string" || !qr.qrcode_img_content.trim()) {
+    throw new Error("invalid QR response");
+  }
+  return { ...qr, accounts };
+}
+
+async function pollQRStatus(apiBaseUrl, qrcode, routeTag, verifyCode, timeoutMs, signal) {
+  let query = `ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`;
+  if (verifyCode) query += `&verify_code=${encodeURIComponent(verifyCode)}`;
   try {
-    const res = await fetch(url.toString(), { headers, signal: controller.signal });
-    clearTimeout(timer);
-    const raw = await res.text();
-    if (!res.ok) throw new Error(`Failed to poll QR status: ${res.status} ${res.statusText} body=${raw}`);
-    return JSON.parse(raw);
+    return await apiGet({
+      baseUrl: apiBaseUrl,
+      path: query,
+      timeoutMs: Math.min(QR_LONG_POLL_TIMEOUT_MS, timeoutMs),
+      label: "pollQRStatus",
+      routeTag,
+      signal,
+    });
   } catch (err) {
-    clearTimeout(timer);
-    if (err.name === "AbortError") {
-      log.debug(`pollQRStatus: client timeout after ${QR_LONG_POLL_TIMEOUT_MS}ms, returning wait`);
+    if (!signal?.aborted && (err?.name === "WeixinTimeoutError" || err?.name === "AbortError" ||
+        err?.status >= 500 || err?.name === "WeixinNetworkError" || err?.name === "TypeError")) {
+      log.debug("QR poll interrupted; retrying until login deadline");
       return { status: QrCodeStatus.WAIT };
     }
     throw err;
+  }
+}
+
+async function requestVerifyCode(onVerifyCode, info, remainingMs, signal) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+  const timer = setTimeout(abort, Math.max(remainingMs, 1));
+  let rl;
+  try {
+    const timeout = new Promise((_, reject) => {
+      if (controller.signal.aborted) return reject(new Error("verify input timeout"));
+      controller.signal.addEventListener("abort", () => reject(new Error("verify input timeout")), { once: true });
+    });
+    let response;
+    if (onVerifyCode) {
+      response = Promise.resolve().then(() => onVerifyCode({ ...info, signal: controller.signal }));
+    } else {
+      rl = createInterface({ input: process.stdin, output: process.stdout });
+      response = rl.question(info.retry ? "配对码不匹配，请重新输入微信显示的数字：" : "请输入手机微信显示的数字：", { signal: controller.signal });
+    }
+    return await Promise.race([response, timeout]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+    rl?.close();
   }
 }
 
@@ -261,177 +357,180 @@ export async function renderQrCode(qrcodeUrl) {
  *
  * @returns {Promise<{qrcodeUrl?:string, sessionKey:string, message:string}>}
  */
-export async function startLogin({ apiBaseUrl = DEFAULT_BASE_URL, botType = DEFAULT_BOT_TYPE, sessionKey, routeTag } = {}) {
+export async function startLogin({ apiBaseUrl = DEFAULT_BASE_URL, botType = DEFAULT_BOT_TYPE, sessionKey, accountId, routeTag, force = false, signal } = {}) {
   purgeExpiredLogins();
-  const key = sessionKey || cryptoRandomKey();
-
+  const key = sessionKey || accountId || randomUUID();
   const existing = activeLogins.get(key);
-  if (existing && Date.now() - existing.startedAt < ACTIVE_LOGIN_TTL_MS && existing.qrcodeUrl) {
+  if (!force && existing && Date.now() - existing.startedAt < ACTIVE_LOGIN_TTL_MS && existing.qrcodeUrl) {
     return { qrcodeUrl: existing.qrcodeUrl, sessionKey: key, message: "二维码已就绪，请使用微信扫描。" };
   }
-
   try {
-    const qr = await fetchQRCode(apiBaseUrl, botType, routeTag);
-    log.info(`QR code received`, { qrcode: redactToken(qr.qrcode), imgLen: qr.qrcode_img_content?.length ?? 0 });
+    const qr = await fetchQRCode(apiBaseUrl, botType, routeTag, signal);
     activeLogins.set(key, {
       qrcode: qr.qrcode,
       qrcodeUrl: qr.qrcode_img_content,
       startedAt: Date.now(),
+      apiBaseUrl,
+      currentApiBaseUrl: apiBaseUrl,
+      accounts: qr.accounts,
+      requestedAccountId: accountId ? normalizeAccountId(accountId) : undefined,
+      verifyAttempts: 0,
+      redirectCount: 0,
+      refreshCount: 1,
     });
+    log.info("QR code received");
     return { qrcodeUrl: qr.qrcode_img_content, sessionKey: key, message: "使用微信扫描以下二维码，以完成连接。" };
   } catch (err) {
-    log.error(`startLogin failed`, { err: String(err) });
-    return { sessionKey: key, message: `Failed to start login: ${String(err)}` };
+    activeLogins.delete(key);
+    return { sessionKey: key, message: `登录发起失败：${safeLoginError(err)}` };
   }
-}
-
-function cryptoRandomKey() {
-  // 不引入 node:crypto 顶层依赖以保持文件聚焦；用 Math + Date 足够做 session key
-  return `login-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 /**
- * 二阶段：轮询扫码状态直到 confirmed / 超时。
- * confirmed 时自动持久化账号凭据。
- *
- * @returns {Promise<{connected:boolean, accountId?:string, baseUrl?:string, userId?:string, message:string}>}
+ * Poll a login session. Library callers can supply an async onVerifyCode callback.
+ * Without a TTY, pairing requests return requiresVerifyCode and remain resumable
+ * via waitForLogin({ sessionKey, verifyCode }) instead of reading stdin forever.
  */
-export async function waitForLogin({ sessionKey, apiBaseUrl = DEFAULT_BASE_URL, botType = DEFAULT_BOT_TYPE, timeoutMs = DEFAULT_LOGIN_TIMEOUT_MS, routeTag, onStatus, persist = true } = {}) {
-  let active = activeLogins.get(sessionKey);
-  if (!active) {
-    return { connected: false, message: "当前没有进行中的登录，请先发起登录。" };
-  }
+export async function waitForLogin({ sessionKey, apiBaseUrl, botType = DEFAULT_BOT_TYPE, timeoutMs = DEFAULT_LOGIN_TIMEOUT_MS, routeTag, onStatus, onRender = renderQrCode, onVerifyCode, verifyCode, persist = true, signal, pollIntervalMs = 1000 } = {}) {
+  const active = activeLogins.get(sessionKey);
+  if (!active) return { connected: false, message: "当前没有进行中的登录，请先发起登录。" };
   if (Date.now() - active.startedAt >= ACTIVE_LOGIN_TTL_MS) {
     activeLogins.delete(sessionKey);
     return { connected: false, message: "二维码已过期，请重新生成。" };
   }
-
-  const deadline = Date.now() + Math.max(timeoutMs, 1000);
-  let refreshCount = 1;
-  let scannedNotified = false;
-
-  log.info(`Polling QR code status...`);
-  while (Date.now() < deadline) {
-    let statusResp;
-    try {
-      statusResp = await pollQRStatus(apiBaseUrl, active.qrcode, routeTag);
-    } catch (err) {
-      log.error(`Error polling QR status`, { err: String(err) });
+  if (verifyCode !== undefined) {
+    if (active.verifyAttempts >= MAX_VERIFY_ATTEMPTS) {
       activeLogins.delete(sessionKey);
-      return { connected: false, message: `登录失败: ${String(err)}` };
+      return { connected: false, message: "配对码尝试次数过多，请重新扫码。" };
     }
-    active.status = statusResp.status;
-    onStatus?.(statusResp.status, statusResp);
-
-    switch (statusResp.status) {
-      case QrCodeStatus.WAIT:
-        break;
-      case QrCodeStatus.SCANED:
-        if (!scannedNotified) {
-          console.log("\n👀 已扫码，请在微信端确认...");
-          scannedNotified = true;
-        }
-        break;
-      case QrCodeStatus.EXPIRED: {
-        refreshCount++;
-        if (refreshCount > MAX_QR_REFRESH_COUNT) {
-          activeLogins.delete(sessionKey);
-          return { connected: false, message: "登录超时：二维码多次过期，请重新开始登录流程。" };
-        }
-        console.log(`\n⏳ 二维码已过期，正在刷新...(${refreshCount}/${MAX_QR_REFRESH_COUNT})`);
-        try {
-          const qr = await fetchQRCode(apiBaseUrl, botType, routeTag);
-          active.qrcode = qr.qrcode;
-          active.qrcodeUrl = qr.qrcode_img_content;
-          active.startedAt = Date.now();
-          scannedNotified = false;
-          console.log("🔄 新二维码已生成，请重新扫描\n");
-          await renderQrCode(qr.qrcode_img_content);
-        } catch (refreshErr) {
-          activeLogins.delete(sessionKey);
-          return { connected: false, message: `刷新二维码失败: ${String(refreshErr)}` };
-        }
-        break;
-      }
-      case QrCodeStatus.CONFIRMED: {
-        if (!statusResp.ilink_bot_id) {
-          activeLogins.delete(sessionKey);
-          return { connected: false, message: "登录失败：服务器未返回 ilink_bot_id。" };
-        }
-        activeLogins.delete(sessionKey);
-        const accountId = normalizeAccountId(statusResp.ilink_bot_id);
-        log.info(`Login confirmed`, { accountId, userId: redactToken(statusResp.ilink_user_id) });
-
-        if (persist) {
-          saveAccount(accountId, {
-            token: statusResp.bot_token,
-            baseUrl: statusResp.baseurl,
-            userId: statusResp.ilink_user_id,
-            accountId,
-          });
-        }
-        return {
-          connected: true,
-          accountId,
-          token: statusResp.bot_token,
-          baseUrl: statusResp.baseurl,
-          userId: statusResp.ilink_user_id,
-          message: "✅ 与微信连接成功！",
-        };
-      }
-    }
-    await sleep(1000);
+    const code = String(verifyCode).trim();
+    if (!/^\d{1,16}$/.test(code)) return { connected: false, requiresVerifyCode: true, sessionKey, message: "请输入手机微信显示的数字配对码。" };
+    active.pendingVerifyCode = code;
+    active.verifyAttempts++;
   }
+  const deadline = Date.now() + Math.max(Number(timeoutMs) || DEFAULT_LOGIN_TIMEOUT_MS, 1000);
+  let scannedNotified = false;
+  const stop = (message) => {
+    activeLogins.delete(sessionKey);
+    return { connected: false, message };
+  };
+  const refresh = async () => {
+    active.refreshCount++;
+    if (active.refreshCount > MAX_QR_REFRESH_COUNT) return false;
+    const qr = await fetchQRCode(active.apiBaseUrl || apiBaseUrl || DEFAULT_BASE_URL, botType, routeTag, signal);
+    active.qrcode = qr.qrcode;
+    active.qrcodeUrl = qr.qrcode_img_content;
+    active.startedAt = Date.now();
+    active.currentApiBaseUrl = active.apiBaseUrl || apiBaseUrl || DEFAULT_BASE_URL;
+    active.accounts = qr.accounts;
+    active.pendingVerifyCode = undefined;
+    active.verifyAttempts = 0;
+    active.redirectCount = 0;
+    scannedNotified = false;
+    await onRender(active.qrcodeUrl);
+    return true;
+  };
 
-  activeLogins.delete(sessionKey);
-  return { connected: false, message: "登录超时，请重试。" };
+  while (Date.now() < deadline && !signal?.aborted) {
+    try {
+      const currentBaseUrl = active.currentApiBaseUrl || apiBaseUrl || DEFAULT_BASE_URL;
+      const response = await pollQRStatus(currentBaseUrl, active.qrcode, routeTag, active.pendingVerifyCode, deadline - Date.now(), signal);
+      if ((response.ret !== undefined && response.ret !== 0) || (response.errcode !== undefined && response.errcode !== 0)) {
+        return stop("登录失败：微信返回了错误状态，请重新登录。");
+      }
+      active.status = response.status;
+      await onStatus?.(response.status, response);
+      switch (response.status) {
+        case QrCodeStatus.WAIT:
+          break;
+        case QrCodeStatus.SCANED:
+          active.pendingVerifyCode = undefined;
+          if (!scannedNotified) {
+            log.info("已扫码，请在微信端确认");
+            scannedNotified = true;
+          }
+          break;
+        case "need_verifycode": {
+          if (active.verifyAttempts >= MAX_VERIFY_ATTEMPTS) return stop("配对码多次不匹配，登录已停止，请重新扫码。");
+          if (!onVerifyCode && !(process.stdin.isTTY && process.stdout.isTTY)) {
+            return { connected: false, requiresVerifyCode: true, sessionKey, message: "登录需要手机微信显示的数字配对码。请在交互终端登录，或提供 onVerifyCode 回调，再通过 waitForLogin({ sessionKey, verifyCode }) 继续。" };
+          }
+          const retry = Boolean(active.pendingVerifyCode);
+          const code = await requestVerifyCode(onVerifyCode, { sessionKey, attempt: active.verifyAttempts + 1, retry, status: response.status }, deadline - Date.now(), signal);
+          if (code === undefined || code === null) return stop("配对码输入已取消，请重新登录。");
+          active.verifyAttempts++;
+          const trimmed = String(code).trim();
+          if (!/^\d{1,16}$/.test(trimmed)) {
+            active.pendingVerifyCode = undefined;
+            if (active.verifyAttempts >= MAX_VERIFY_ATTEMPTS) return stop("配对码输入无效，登录已停止，请重新扫码。");
+            continue;
+          }
+          active.pendingVerifyCode = trimmed;
+          continue;
+        }
+        case QrCodeStatus.EXPIRED:
+        case "verify_code_blocked":
+          if (!(await refresh())) return stop(response.status === "verify_code_blocked" ? "多次输入错误，登录已停止，请稍后重新扫码。" : "二维码多次过期，登录已停止，请重新扫码。");
+          continue;
+        case "scaned_but_redirect":
+          if (++active.redirectCount > MAX_LOGIN_REDIRECTS) return stop("登录重定向次数过多，请重新扫码。");
+          if (!response.redirect_host) return stop("登录失败：微信未提供重定向地址。");
+          active.currentApiBaseUrl = validateServerBaseUrl(response.redirect_host);
+          continue;
+        case "binded_redirect": {
+          let candidates = active.accounts || [];
+          const responseId = response.ilink_bot_id ? normalizeAccountId(response.ilink_bot_id) : undefined;
+          if (responseId) candidates = candidates.filter((account) => account.accountId === responseId);
+          if (response.bot_token) candidates = candidates.filter((account) => account.token === response.bot_token.trim());
+          if (active.requestedAccountId) candidates = candidates.filter((account) => account.accountId === active.requestedAccountId);
+          if (candidates.length !== 1) return stop("微信提示已绑定，但无法对应本地有效凭据。请指定账号或重新扫码绑定。");
+          const saved = loadAccount(candidates[0].accountId);
+          if (!saved || typeof saved.token !== "string" || saved.token.trim() !== candidates[0].token) return stop("微信提示已绑定，但本地凭据已失效或缺失，请重新登录。");
+          const effectiveBaseUrl = response.baseurl || (currentBaseUrl !== active.apiBaseUrl ? currentBaseUrl : saved.baseUrl || currentBaseUrl);
+          const baseUrl = validateServerBaseUrl(effectiveBaseUrl);
+          activeLogins.delete(sessionKey);
+          if (persist && currentBaseUrl !== active.apiBaseUrl && saved.baseUrl !== baseUrl) saveAccount(candidates[0].accountId, { baseUrl });
+          return { connected: true, alreadyConnected: true, accountId: candidates[0].accountId, token: saved.token.trim(), baseUrl, userId: saved.userId, message: "✅ 此微信账号已连接，已复用本地登录凭据。" };
+        }
+        case QrCodeStatus.CONFIRMED: {
+          const token = typeof response.bot_token === "string" ? response.bot_token.trim() : "";
+          const accountId = normalizeAccountId(response.ilink_bot_id);
+          if (!token || !accountId || !/^[A-Za-z0-9_.-]+$/.test(accountId)) return stop("登录失败：微信未返回完整的账号 ID 和登录凭据，请重新扫码。");
+          const baseUrl = validateServerBaseUrl(response.baseurl || currentBaseUrl);
+          activeLogins.delete(sessionKey);
+          if (persist) saveAccount(accountId, { token, baseUrl, userId: response.ilink_user_id, accountId });
+          log.info("Login confirmed", { accountId });
+          return { connected: true, accountId, token, baseUrl, userId: response.ilink_user_id, message: "✅ 与微信连接成功！" };
+        }
+        default:
+          return stop("登录失败：微信返回了未知登录状态，请稍后重试。");
+      }
+      await sleep(Math.min(Math.max(pollIntervalMs, 0), Math.max(deadline - Date.now(), 0)), signal);
+    } catch (err) {
+      return stop(`登录失败：${safeLoginError(err)}`);
+    }
+  }
+  return stop(signal?.aborted ? "登录已取消。" : "登录超时，请重试。");
 }
 
-/**
- * 便捷一站式登录：start + 渲染 + wait。
- *
- * @param {object} opts
- * @param {function} [opts.onRender] - 自定义二维码渲染，默认终端渲染
- * @param {function} [opts.onStatus] - 状态回调 (status, resp) => void
- */
+/** One-step login, including QR refresh and optional pairing-code callback. */
 export async function login(opts = {}) {
-  const {
-    apiBaseUrl = DEFAULT_BASE_URL,
-    botType = DEFAULT_BOT_TYPE,
-    timeoutMs = DEFAULT_LOGIN_TIMEOUT_MS,
-    routeTag,
-    onRender = renderQrCode,
-    onStatus,
-    persist = true,
-  } = opts;
-
+  const apiBaseUrl = opts.apiBaseUrl || DEFAULT_BASE_URL;
+  const onRender = opts.onRender || renderQrCode;
   console.log("\n🔐 开始微信扫码登录...\n");
-  const start = await startLogin({ apiBaseUrl, botType, routeTag });
-  if (!start.qrcodeUrl) {
-    throw new Error(start.message);
-  }
-  console.log("📱 请用微信扫描以下二维码：\n");
+  const start = await startLogin({ ...opts, apiBaseUrl });
+  if (!start.qrcodeUrl) throw new Error(start.message);
   await onRender(start.qrcodeUrl);
-  console.log("\n⏳ 等待扫码...\n");
-
-  const result = await waitForLogin({
-    sessionKey: start.sessionKey,
-    apiBaseUrl,
-    botType,
-    timeoutMs,
-    routeTag,
-    onStatus,
-    persist,
-  });
-
+  const result = await waitForLogin({ ...opts, sessionKey: start.sessionKey, apiBaseUrl, onRender });
   if (!result.connected) {
-    throw new Error(result.message);
+    const error = new Error(result.message);
+    error.requiresVerifyCode = result.requiresVerifyCode;
+    error.sessionKey = result.sessionKey;
+    throw error;
   }
   console.log(`\n${result.message}`);
   console.log(`  Account ID : ${result.accountId}`);
-  console.log(`  Base URL   : ${result.baseUrl ?? apiBaseUrl}`);
-  if (result.userId) console.log(`  User ID    : ${redactToken(result.userId)}`);
-  console.log("");
+  console.log(`  Base URL   : ${result.baseUrl}`);
   return result;
 }
 

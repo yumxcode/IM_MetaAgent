@@ -54,7 +54,11 @@ import fs from "node:fs";
 import { WeixinBot, log } from "./src/index.mjs";
 import { resolveStateDir, readJson, writeJson, ensureDir } from "./src/util.mjs";
 import { checkMetaAgent, runMetaAgent } from "./src/meta-agent-bridge.mjs";
-import { installProcessGuards } from "./src/process-guard.mjs";
+import { installProcessGuards, installGracefulShutdown } from "./src/process-guard.mjs";
+import { createTaskBackend } from "./src/meta-agent-tasks.mjs";
+import { createTaskChat, TASK_COMMANDS } from "./src/task-chat.mjs";
+import { createReplyProgress } from "./src/reply-progress.mjs";
+import { parseAgentTrigger } from "./src/message-trigger.mjs";
 
 // ---------------------------------------------------------------------------
 // 状态目录（与 auth.mjs 一致：优先 weixin-bot，回退 openclaw-weixin）
@@ -77,6 +81,8 @@ const CFG = {
   timeoutMs: Number(process.env.META_AGENT_TIMEOUT_MS) || 0,
   cloneTimeoutMs: Number(process.env.META_AGENT_CLONE_TIMEOUT_MS) || 600_000,
   maxConcurrent: Number(process.env.META_AGENT_MAX_CONCURRENT) || 2,
+  progressMessages: process.env.WEIXIN_REPLY_PROGRESS_MESSAGES !== "false",
+  taskMaxRunning: Number(process.env.META_AGENT_TASKS_MAX_RUNNING) || 3,
 
   // 触发与权限
   triggerPrefix: process.env.WEIXIN_TRIGGER_PREFIX ?? "/",
@@ -184,48 +190,11 @@ function resolveSessionDir(accountId) {
 // 触发判断
 // ---------------------------------------------------------------------------
 
-/**
- * @returns {{action:"clear"|"project"|"respond"|"goal"|"ignore", subcmd?, args?, prompt?}}
- */
+const taskBackend = createTaskBackend();
+const taskChat = createTaskChat({ backend: taskBackend, maxRunning: CFG.taskMaxRunning });
+
 function parseTrigger(msg) {
-  const raw = msg.text?.trim();
-
-  // /clear: 最高优先级
-  if (raw === "/clear") return { action: "clear" };
-
-  // /p 指令: 元指令，私聊群聊均识别（在群聊前缀检测之前）
-  if (raw === "/p" || raw?.startsWith("/p ")) {
-    const rest = raw === "/p" ? "" : raw.slice(3).trim();
-    const parts = rest.split(/\s+/);
-    const sub = parts[0] || "";
-    const args = parts.slice(1);
-    return { action: "project", subcmd: sub, args };
-  }
-
-  // /goal 指令: 用 auto 完整自主模式执行复杂目标（私聊群聊均识别）
-  if (raw === "/goal" || raw?.startsWith("/goal ")) {
-    const goalPrompt = raw === "/goal" ? "" : raw.slice(6).trim();
-    return { action: "goal", prompt: goalPrompt };
-  }
-
-  // 白名单
-  if (CFG.allowFrom.length && !CFG.allowFrom.includes(msg.fromUserId)) {
-    return { action: "ignore" };
-  }
-  if (!raw) return { action: "ignore" };
-
-  const isGroup = Boolean(msg.groupId);
-  if (!isGroup) return { action: "respond", prompt: raw };
-
-  switch (CFG.groupTrigger) {
-    case "off": return { action: "ignore" };
-    case "all": return { action: "respond", prompt: raw };
-    case "prefix":
-    default:
-      if (!raw.startsWith(CFG.triggerPrefix)) return { action: "ignore" };
-      const prompt = raw.slice(CFG.triggerPrefix.length).replace(/^@\S+\s*/, "").trim();
-      return { action: prompt ? "respond" : "ignore", prompt };
-  }
+  return parseAgentTrigger(msg, CFG);
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +349,7 @@ function splitIntoChunks(text, maxSize = WX_CHUNK_SIZE) {
   let buf = "";
   const pushLine = (line) => {
     if (line.length > maxSize) {
+      if (buf) chunks.push(buf);
       for (let i = 0; i < line.length; i += maxSize) chunks.push(line.slice(i, i + maxSize));
       buf = "";
       return;
@@ -448,6 +418,13 @@ async function handleMessage(bot, msg) {
   const from = msg.fromUserId;
   const wxAcct = msg.accountId;
 
+  // Task management bypasses ordinary prompt locks so it stays available mid-run.
+  if (trig.action === "tasks") {
+    const text = await taskChat.handle(msg, trig.request);
+    await sendReply(bot, msg, { ok: true, text });
+    return;
+  }
+
   // /clear：清当前项目的 session
   if (trig.action === "clear") {
     const curId = sessionStore.getCurrentProject(from);
@@ -498,6 +475,8 @@ async function handleMessage(bot, msg) {
   const typing = await bot.typing({ to: from, contextToken: msg.contextToken }).catch(() => null);
   await typing?.start().catch(() => {});
 
+  const progress = createReplyProgress(bot, msg, { enabled: CFG.progressMessages });
+  const replyMsg = { ...msg, runId: progress.runId };
   try {
     // 确定当前项目 + workspace + session
     let curId = sessionStore.getCurrentProject(from);
@@ -527,8 +506,10 @@ async function handleMessage(bot, msg) {
       timeoutMs: CFG.timeoutMs,
       resumeSessionId: resumeId,
       sessionDir: resolveSessionDir(wxAcct),
+      onEvent: progress.onEvent,
     });
 
+    await progress.finalize();
     if (r.sessionId) sessionStore.setSession(from, curId, r.sessionId);
 
     // resume 失败：清掉，提示重发
@@ -538,12 +519,13 @@ async function handleMessage(bot, msg) {
       return;
     }
 
-    const replyLen = await sendReply(bot, msg, r);
+    const replyLen = await sendReply(bot, replyMsg, r);
     log.info(`✅ 已回复`, { ok: r.ok, subtype: r.subtype, turns: r.numTurns, costUsd: r.costUsd, len: replyLen, project: curId, session: r.sessionId });
   } catch (err) {
     log.error(`meta-agent 执行异常`, { err: String(err) });
     await bot.reply(msg, `❌ 执行异常：${err.message}`).catch(() => {});
   } finally {
+    await progress.finalize();
     activeTaskCount--;
     userLocks.set(from, false);
     await typing?.stop().catch(() => {});
@@ -572,6 +554,12 @@ async function cmdCheck() {
   console.log(`   白名单    : ${CFG.allowFrom.length ? CFG.allowFrom.join(", ") : "(不限)"}`);
 }
 
+async function cmdTasksCheck() {
+  const text = await taskChat.handle({ accountId: "local", fromUserId: "local" }, { command: "list", args: "" });
+  console.log(text);
+  if (text.startsWith("❌")) process.exitCode = 1;
+}
+
 async function cmdAccounts() {
   const bot = new WeixinBot();
   const ids = bot.listAccounts();
@@ -588,7 +576,8 @@ async function cmdAccounts() {
 
 async function cmdLogin() {
   const bot = new WeixinBot();
-  await bot.login();
+  const loginResult = await bot.login();
+  if (loginResult.connected === false) { console.error(loginResult.message); process.exitCode = 1; return; }
   console.log("\n📦 凭据已持久化。运行 `node weixin-meta-agent.mjs` 开始监听。");
 }
 
@@ -606,7 +595,7 @@ async function cmdRun() {
     console.error("❌ 没有已登录微信账号。先运行: node weixin-meta-agent.mjs --login");
     process.exit(1);
   }
-  bot.setDefaultAccount(existing[0]);
+  bot.setDefaultAccount(bot.getDefaultAccount());
   const info = bot.getAccountInfo();
   if (info.paused) {
     console.error(`❌ 账号 ${info.accountId} 处于 session 暂停期，请稍后或 --login 重登`);
@@ -629,9 +618,11 @@ async function cmdRun() {
   console.log(`   私聊       : 全响应（无项目时自动创建临时项目）`);
   console.log(`   群聊       : ${CFG.groupTrigger === "off" ? "不响应" : CFG.groupTrigger === "all" ? "全响应" : `需前缀 "${CFG.triggerPrefix}"`}`);
   console.log(`   项目指令   : /p（私聊群聊均识别）`);
+  console.log(`   任务指令   : /tasks（查询全局 GLM 任务；/tasks manage start 启动自动调度）`);
   console.log(`   最大并发   : ${CFG.maxConcurrent}（超过回复"系统繁忙"）`);
   console.log(`   白名单     : ${CFG.allowFrom.length ? CFG.allowFrom.join(", ") : "(不限)"}`);
   console.log("   Ctrl+C 退出\n");
+  installGracefulShutdown(bot, { close: () => taskBackend.close() });
   await bot.start();
 }
 
@@ -643,6 +634,7 @@ function printHelp() {
   node weixin-meta-agent.mjs --login        扫码登录
   node weixin-meta-agent.mjs --check        自检 meta-agent CLI + 打印配置
   node weixin-meta-agent.mjs --accounts     列出已登录账号
+  node weixin-meta-agent.mjs --tasks-check  只读检查 GLM 任务查询（无需微信）
   node weixin-meta-agent.mjs --help         显示本帮助
 
 微信指令:
@@ -657,7 +649,11 @@ function printHelp() {
   无项目时发文本       自动创建临时项目
   /goal <目标>        用 auto 完整自主模式执行复杂目标（默认对话为 simple_auto）
 
-环境变量见脚本头部注释。
+${TASK_COMMANDS}
+
+任务配置: META_AGENT_TASKS_BIN（默认 meta-agent-glm）、META_AGENT_TASKS_PROFILE、
+META_AGENT_TASKS_RUNTIME_DIR、META_AGENT_TASKS_MAX_RUNNING（默认 3）。
+其他环境变量见脚本头部注释。
 `);
 }
 
@@ -671,6 +667,7 @@ async function main() {
   if (args.includes("--accounts")) return cmdAccounts();
   if (args.includes("--login")) return cmdLogin();
   if (args.includes("--check")) return cmdCheck();
+  if (args.includes("--tasks-check")) return cmdTasksCheck();
   return cmdRun();
 }
 

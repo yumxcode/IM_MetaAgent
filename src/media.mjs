@@ -1,334 +1,308 @@
-/**
- * 媒体处理模块
- *
- * 覆盖微信 iLink 的全部媒体能力：
- *  - AES-128-ECB 加解密（PKCS7 padding）
- *  - CDN 上传（getUploadUrl → POST 加密文件 → 拿 download param）
- *  - CDN 下载（encrypt_query_param → GET → 解密）
- *  - MIME 类型映射
- *  - 远程文件下载到本地临时文件
- *  - SILK 语音 → WAV 转码（可选依赖 silk-wasm）
- *  - 统一的本地文件上传管线（按 MIME 路由到 image/video/file）
- *
- * 与官方插件的 CDN + 媒体管线行为对齐。
- */
+/** 微信 iLink CDN 媒体上传、下载与 AES-128-ECB 加解密。 */
 import crypto from "node:crypto";
-import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
 
 import { CDN_BASE_URL, UploadMediaType, WEIXIN_MEDIA_MAX_BYTES, SILK_SAMPLE_RATE } from "./constants.mjs";
 import { getUploadUrl } from "./http.mjs";
-import {
-  encryptAesEcb,
-  decryptAesEcb,
-  aesEcbPaddedSize,
-} from "./crypto.mjs";
+import { encryptAesEcb, decryptAesEcb, aesEcbPaddedSize } from "./crypto.mjs";
 import { getExtensionFromContentTypeOrUrl, getMimeFromFilename } from "./mime.mjs";
 import { log, randomAesKey, randomFileKey, tempFileName } from "./util.mjs";
 
-// ---------------------------------------------------------------------------
-// CDN URL 构建
-// ---------------------------------------------------------------------------
-
-/** 构建 CDN 下载 URL。 */
-export function buildCdnDownloadUrl(encryptedQueryParam, cdnBaseUrl = CDN_BASE_URL) {
-  return `${cdnBaseUrl}/download?encrypted_query_param=${encodeURIComponent(encryptedQueryParam)}`;
-}
-
-/** 构建 CDN 上传 URL。 */
-export function buildCdnUploadUrl({ cdnBaseUrl, uploadParam, filekey }) {
-  return `${cdnBaseUrl}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
-}
-
-// ---------------------------------------------------------------------------
-// CDN 上传（带 AES-128-ECB 加密 + 重试）
-// ---------------------------------------------------------------------------
-
+const MEDIA_TIMEOUT_MS = 60_000;
 const UPLOAD_MAX_RETRIES = 3;
 
-/**
- * 上传一个 buffer 到微信 CDN，返回 CDN 下发的 download encrypted_query_param。
- * 内部完成 AES-128-ECB 加密。服务端错误重试，4xx 客户端错误立即终止。
- *
- * @returns {Promise<string>} downloadParam（用于回填到 media.encrypt_query_param）
- */
-export async function uploadBufferToCdn({ buf, uploadParam, filekey, cdnBaseUrl, aeskey, label = "cdn-upload" }) {
-  const ciphertext = encryptAesEcb(buf, aeskey);
-  const cdnUrl = buildCdnUploadUrl({ cdnBaseUrl, uploadParam, filekey });
-  log.debug(`${label}: CDN POST`, { url: `(cdn)`, ciphertextSize: ciphertext.length });
+function httpUrl(value) {
+  if (typeof value !== "string" || !value.trim()) throw new Error("media URL is missing");
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error("media URL is invalid"); }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+    throw new Error("media URL must use HTTP or HTTPS without credentials");
+  }
+  return value; // Preserve signed URLs byte-for-byte; never append query parameters.
+}
 
-  let downloadParam;
+function byteLimit(maxBytes = WEIXIN_MEDIA_MAX_BYTES) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid media byte limit");
+  return Math.min(maxBytes, WEIXIN_MEDIA_MAX_BYTES);
+}
+
+function assertSize(size, limit, label = "media") {
+  if (size > limit) throw new Error(`${label}: media exceeds ${limit} byte limit`);
+}
+
+function requestScope({ timeoutMs = MEDIA_TIMEOUT_MS, signal } = {}, label) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("invalid media timeout");
+  const controller = new AbortController();
+  let rejectAbort;
+  let failure;
+  const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+  // The caller may start with an already-aborted signal.
+  aborted.catch(() => {});
+  const abort = (kind) => {
+    if (failure) return;
+    failure = new Error(`${label}: ${kind}`);
+    failure.code = kind === "request cancelled" ? "MEDIA_CANCELLED" : "MEDIA_TIMEOUT";
+    controller.abort();
+    rejectAbort(failure);
+  };
+  const onAbort = () => abort("request cancelled");
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => abort(`timeout after ${timeoutMs}ms`), timeoutMs);
+  if (signal?.aborted) onAbort();
+  return {
+    signal: controller.signal,
+    race(action) {
+      if (failure) return Promise.reject(failure);
+      return Promise.race([Promise.resolve().then(action), aborted]);
+    },
+    error() { return failure; },
+    close() { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); },
+  };
+}
+
+function cancelBody(res) { void res?.body?.cancel?.().catch(() => {}); }
+
+/** Build the legacy CDN URL from its base and encrypted query parameter. */
+export function buildCdnDownloadUrl(encryptedQueryParam, cdnBaseUrl = CDN_BASE_URL) {
+  if (typeof encryptedQueryParam !== "string" || !encryptedQueryParam) throw new Error("CDN download parameter is missing");
+  httpUrl(cdnBaseUrl);
+  return `${cdnBaseUrl.replace(/\/+$/, "")}/download?encrypted_query_param=${encodeURIComponent(encryptedQueryParam)}`;
+}
+
+export function buildCdnUploadUrl({ cdnBaseUrl = CDN_BASE_URL, uploadParam, uploadFullUrl, filekey }) {
+  if (uploadFullUrl) return httpUrl(uploadFullUrl);
+  httpUrl(cdnBaseUrl);
+  if (!uploadParam || !filekey) throw new Error("CDN upload parameters are missing");
+  return `${cdnBaseUrl.replace(/\/+$/, "")}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
+}
+
+/** Upload encrypted media, accepting either the new upload_full_url or legacy upload_param. */
+export async function uploadBufferToCdn({ buf, uploadParam, uploadFullUrl, upload_full_url, filekey,
+  cdnBaseUrl = CDN_BASE_URL, aeskey, label = "cdn-upload", timeoutMs, signal, maxBytes }) {
+  if (!Buffer.isBuffer(buf) && !(buf instanceof Uint8Array)) throw new Error("media buffer must be bytes");
+  const limit = byteLimit(maxBytes);
+  assertSize(buf.byteLength, limit, label);
+  const ciphertext = encryptAesEcb(buf, aeskey);
+  assertSize(ciphertext.length, aesEcbPaddedSize(limit), label);
+  const cdnUrl = buildCdnUploadUrl({ cdnBaseUrl, uploadParam, uploadFullUrl: uploadFullUrl ?? upload_full_url, filekey });
   let lastError;
   for (let attempt = 1; attempt <= UPLOAD_MAX_RETRIES; attempt++) {
+    const scope = requestScope({ timeoutMs, signal }, label);
+    let res;
     try {
-      const res = await fetch(cdnUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: new Uint8Array(ciphertext),
-      });
-
-      // 4xx 客户端错误：不可重试
+      res = await scope.race(() => fetch(cdnUrl, {
+        method: "POST", headers: { "Content-Type": "application/octet-stream" },
+        body: new Uint8Array(ciphertext), signal: scope.signal,
+      }));
       if (res.status >= 400 && res.status < 500) {
-        const errMsg = res.headers.get("x-error-message") ?? (await res.text());
-        throw new Error(`CDN upload client error ${res.status}: ${errMsg}`);
+        const err = new Error(`${label}: CDN upload client error ${res.status}`);
+        err.code = "MEDIA_CLIENT_ERROR";
+        throw err;
       }
-      // 5xx / 非 200：可重试
-      if (res.status !== 200) {
-        const errMsg = res.headers.get("x-error-message") ?? `status ${res.status}`;
-        throw new Error(`CDN upload server error: ${errMsg}`);
-      }
-
-      downloadParam = res.headers.get("x-encrypted-param");
-      if (!downloadParam) {
-        throw new Error("CDN upload response missing x-encrypted-param header");
+      if (res.status !== 200) throw new Error(`${label}: CDN upload server status ${res.status}`);
+      const downloadParam = res.headers.get("x-encrypted-param");
+      if (typeof downloadParam !== "string" || !downloadParam.trim()) {
+        throw new Error(`${label}: CDN upload response missing x-encrypted-param header`);
       }
       log.debug(`${label}: CDN upload success attempt=${attempt}`);
-      break;
+      return downloadParam;
     } catch (err) {
-      lastError = err;
-      // 客户端错误不重试
-      if (err.message?.includes("client error")) throw err;
-      if (attempt < UPLOAD_MAX_RETRIES) {
-        log.warn(`${label}: attempt ${attempt} failed, retrying`, { err: String(err) });
-      } else {
-        log.error(`${label}: all ${UPLOAD_MAX_RETRIES} attempts failed`, { err: String(err) });
-      }
-    }
+      // Never surface fetch causes, response bodies, signed URLs or AES keys.
+      lastError = scope.error() ?? (err?.code === "MEDIA_CLIENT_ERROR" ? err : new Error(
+        `${label}: CDN upload failed${res ? ` (status ${res.status}, invalid response)` : " (network error)"}`));
+      if (["MEDIA_CLIENT_ERROR", "MEDIA_CANCELLED", "MEDIA_TIMEOUT"].includes(lastError.code)) throw lastError;
+      if (attempt < UPLOAD_MAX_RETRIES) log.warn(`${label}: CDN upload attempt ${attempt} failed, retrying`);
+    } finally { cancelBody(res); scope.close(); }
   }
-
-  if (!downloadParam) {
-    throw lastError instanceof Error
-      ? lastError
-      : new Error(`CDN upload failed after ${UPLOAD_MAX_RETRIES} attempts`);
-  }
-  return downloadParam;
+  throw lastError;
 }
 
-// ---------------------------------------------------------------------------
-// CDN 下载（带 AES-128-ECB 解密）
-// ---------------------------------------------------------------------------
-
-/**
- * 解析 CDNMedia.aes_key 字段为原始 16 字节 AES key。
- *
- * 微信 CDN 实际存在两种 aes_key 编码：
- *  - base64(原始 16 字节)            → 图片（media.aes_key）
- *  - base64(16 字节的 hex 字符串)    → 文件 / 语音 / 视频
- * 后者 base64 解码后是 32 个 ASCII hex 字符，需再 hex 解析为 16 字节。
- */
+/** CDN aes_key accepts base64(raw 16 bytes) and base64(32 ASCII hex characters). */
 export function parseAesKey(aesKeyBase64, label = "cdn") {
+  if (typeof aesKeyBase64 !== "string" || aesKeyBase64.length > 44 || !/^[A-Za-z0-9+/]+={0,2}$/.test(aesKeyBase64)
+      || aesKeyBase64.length % 4 === 1) throw new Error(`${label}: invalid base64 aes_key`);
   const decoded = Buffer.from(aesKeyBase64, "base64");
-  if (decoded.length === 16) return decoded;
-  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString("ascii"))) {
-    return Buffer.from(decoded.toString("ascii"), "hex");
+  if (decoded.toString("base64").replace(/=+$/, "") !== aesKeyBase64.replace(/=+$/, "")) {
+    throw new Error(`${label}: invalid base64 aes_key`);
   }
-  throw new Error(
-    `${label}: aes_key must decode to 16 raw bytes or 32-char hex string, got ${decoded.length} bytes`,
-  );
+  if (decoded.length === 16) return decoded;
+  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString("latin1"))) {
+    return Buffer.from(decoded.toString("latin1"), "hex");
+  }
+  throw new Error(`${label}: aes_key must decode to 16 raw bytes or 32 ASCII hex characters`);
 }
 
-async function fetchCdnBytes(url, label) {
+async function readResponseBytes(res, scope, maxBytes, label) {
+  const declaredLength = res.headers.get("content-length");
+  if (declaredLength && /^\d+$/.test(declaredLength)) assertSize(Number(declaredLength), maxBytes, label);
+  if (!res.body) return Buffer.alloc(0);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let size = 0;
+  let finished = false;
+  try {
+    while (true) {
+      const { done, value } = await scope.race(() => reader.read());
+      if (done) { finished = true; break; }
+      size += value.byteLength;
+      assertSize(size, maxBytes, label);
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, size);
+  } finally {
+    if (!finished) void reader.cancel().catch(() => {});
+    try { reader.releaseLock(); } catch { /* pending abort read */ }
+  }
+}
+
+async function fetchMediaBytes(url, options, label, maxBytes) {
+  httpUrl(url);
+  const scope = requestScope(options, label);
   let res;
   try {
-    res = await fetch(url);
+    res = await scope.race(() => fetch(url, { signal: scope.signal }));
+    if (!res.ok) throw new Error(`${label}: CDN download HTTP ${res.status}`);
+    const buf = await readResponseBytes(res, scope, maxBytes, label);
+    return { buf, contentType: res.headers.get("content-type") };
   } catch (err) {
-    log.error(`${label}: CDN fetch network error`, { err: String(err) });
-    throw err;
-  }
-  if (!res.ok) {
-    const body = await res.text().catch(() => "(unreadable)");
-    throw new Error(`${label}: CDN download ${res.status} ${res.statusText} body=${body}`);
-  }
-  return Buffer.from(await res.arrayBuffer());
+    if (scope.error()) throw scope.error();
+    if (err?.message?.startsWith(`${label}: media exceeds`) || err?.message?.startsWith(`${label}: CDN download HTTP`)) throw err;
+    throw new Error(`${label}: media download failed (network or response error)`);
+  } finally { cancelBody(res); scope.close(); }
 }
 
-/**
- * 下载并 AES-128-ECB 解密一个 CDN 媒体文件，返回明文 Buffer。
- *
- * @param {string} encryptedQueryParam - encrypt_query_param
- * @param {string} aesKeyBase64 - CDNMedia.aes_key（base64）
- * @param {string} [cdnBaseUrl]
- * @param {string} [label]
- * @returns {Promise<Buffer>} 明文
+function mediaDownloadUrl(media, cdnBaseUrl) {
+  return media.full_url ? httpUrl(media.full_url) : buildCdnDownloadUrl(
+    media.encrypt_query_param ?? media.encrypted_query_param, cdnBaseUrl);
+}
+
+/** New form: downloadAndDecryptBuffer(CDNMedia, {cdnBaseUrl, label, timeoutMs, signal, maxBytes}).
+ * Legacy positional form remains supported: (query, aesKeyBase64, cdnBaseUrl, label).
  */
-export async function downloadAndDecryptBuffer(encryptedQueryParam, aesKeyBase64, cdnBaseUrl = CDN_BASE_URL, label = "cdn-download") {
-  const key = parseAesKey(aesKeyBase64, label);
-  const url = buildCdnDownloadUrl(encryptedQueryParam, cdnBaseUrl);
-  log.debug(`${label}: fetching`, { url: `(cdn)` });
-  const encrypted = await fetchCdnBytes(url, label);
-  log.debug(`${label}: downloaded ${encrypted.byteLength} bytes, decrypting`);
-  return decryptAesEcb(encrypted, key);
+export async function downloadAndDecryptBuffer(mediaOrParam, keyOrOptions, cdnBaseUrl = CDN_BASE_URL, label = "cdn-download") {
+  const modern = mediaOrParam && typeof mediaOrParam === "object";
+  const media = modern ? mediaOrParam : { encrypt_query_param: mediaOrParam, aes_key: keyOrOptions };
+  const options = modern ? (keyOrOptions ?? {}) : {};
+  label = options.label ?? label;
+  const limit = byteLimit(options.maxBytes);
+  const key = parseAesKey(media.aes_key, label);
+  const { buf } = await fetchMediaBytes(mediaDownloadUrl(media, options.cdnBaseUrl ?? cdnBaseUrl), options, label, aesEcbPaddedSize(limit));
+  let plaintext;
+  try { plaintext = decryptAesEcb(buf, key); } catch { throw new Error(`${label}: invalid encrypted media`); }
+  assertSize(plaintext.length, limit, label);
+  return plaintext;
 }
 
-/** 下载 CDN 原始字节（不解密，用于无 aes_key 的场景）。 */
-export async function downloadPlainCdnBuffer(encryptedQueryParam, cdnBaseUrl = CDN_BASE_URL, label = "cdn-download-plain") {
-  const url = buildCdnDownloadUrl(encryptedQueryParam, cdnBaseUrl);
-  log.debug(`${label}: fetching`, { url: `(cdn)` });
-  return fetchCdnBytes(url, label);
+/** New form: downloadPlainCdnBuffer(CDNMedia, options); legacy (query, cdnBaseUrl, label). */
+export async function downloadPlainCdnBuffer(mediaOrParam, baseOrOptions = CDN_BASE_URL, label = "cdn-download-plain") {
+  const modern = mediaOrParam && typeof mediaOrParam === "object";
+  const media = modern ? mediaOrParam : { encrypt_query_param: mediaOrParam };
+  const options = modern && typeof baseOrOptions === "object" ? baseOrOptions : {};
+  label = options.label ?? label;
+  const cdnBaseUrl = options.cdnBaseUrl ?? (typeof baseOrOptions === "string" ? baseOrOptions : CDN_BASE_URL);
+  return (await fetchMediaBytes(mediaDownloadUrl(media, cdnBaseUrl), options, label, byteLimit(options.maxBytes))).buf;
 }
 
-// ---------------------------------------------------------------------------
-// 远程 URL → 本地临时文件
-// ---------------------------------------------------------------------------
-
-/**
- * 下载远程 http(s) URL 到本地临时文件。
- * 扩展名从 Content-Type 或 URL 推断。
- */
-export async function downloadRemoteUrlToTemp(url, destDir) {
-  log.debug(`downloadRemoteUrlToTemp: fetching`, { url });
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`remote media download failed: ${res.status} ${res.statusText} url=${url}`);
-  }
-  const buf = Buffer.from(await res.arrayBuffer());
-  await fs.mkdir(destDir, { recursive: true });
-  const ext = getExtensionFromContentTypeOrUrl(res.headers.get("content-type"), url);
-  const name = tempFileName("weixin-remote", ext);
-  const filePath = path.join(destDir, name);
-  await fs.writeFile(filePath, buf);
-  log.debug(`downloadRemoteUrlToTemp: saved`, { filePath, size: buf.length });
-  return filePath;
+/** Download bounded remote HTTP(S) media and leave no partial temporary file on failure. */
+export async function downloadRemoteUrlToTemp(url, destDir, options = {}) {
+  const { buf, contentType } = await fetchMediaBytes(url, options, "remote-media", byteLimit(options.maxBytes));
+  const ext = getExtensionFromContentTypeOrUrl(contentType, url);
+  return saveBufferToFile(buf, destDir, { ext, prefix: "weixin-remote" });
 }
 
-// ---------------------------------------------------------------------------
-// 统一上传管线：本地文件 → CDN
-// ---------------------------------------------------------------------------
-
-/**
- * 上传后的文件信息，用于构造出站消息的 media 引用。
- */
 export class UploadedFileInfo {
   constructor({ filekey, downloadEncryptedQueryParam, aeskey, fileSize, fileSizeCiphertext }) {
-    this.filekey = filekey;
-    /** 回填到 media.encrypt_query_param */
-    this.downloadEncryptedQueryParam = downloadEncryptedQueryParam;
-    /** AES-128 key，hex 字符串；构造消息时转 base64 */
-    this.aeskey = aeskey;
-    /** 明文字节数 */
-    this.fileSize = fileSize;
-    /** 密文字节数（AES-128-ECB + PKCS7） */
-    this.fileSizeCiphertext = fileSizeCiphertext;
+    Object.assign(this, { filekey, downloadEncryptedQueryParam, aeskey, fileSize, fileSizeCiphertext });
   }
 }
 
-/**
- * 上传本地文件到微信 CDN 的通用管线。
- *
- * 流程：读取文件 → MD5 → 生成 aeskey → getUploadUrl → uploadBufferToCdn → 返回信息。
- * 缩略图：微信协议要求 IMAGE/VIDEO 提供缩略图，但实测 no_need_thumb:true 可跳过，
- * 与官方插件实现一致。
- */
-async function uploadMediaToCdn({ filePath, toUserId, opts, cdnBaseUrl, mediaType, label }) {
-  const plaintext = await fs.readFile(filePath);
+/** Read a regular file after checking its stat; bound reads even if the file grows during upload. */
+async function readLocalMedia(filePath, maxBytes) {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error("media upload requires a regular file");
+    assertSize(stat.size, maxBytes);
+    const chunks = [];
+    let size = 0;
+    while (true) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - size));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (!bytesRead) break;
+      size += bytesRead;
+      assertSize(size, maxBytes);
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    return Buffer.concat(chunks, size);
+  } finally { await handle.close(); }
+}
+
+export function isSilkBuffer(buf) {
+  if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf);
+  return buf.subarray(0, 9).toString("latin1") === "#!SILK_V3"
+    || (buf[0] === 2 && buf.subarray(1, 10).toString("latin1") === "#!SILK_V3");
+}
+
+async function uploadMediaBuffer({ plaintext, toUserId, opts = {}, cdnBaseUrl, mediaType, label, maxBytes }) {
+  const limit = byteLimit(maxBytes ?? opts.maxBytes);
+  assertSize(plaintext.length, limit, label);
+  if (mediaType === UploadMediaType.VOICE && !isSilkBuffer(plaintext)) {
+    throw new Error(`${label}: voice upload requires SILK V3 encoded audio`);
+  }
   const rawsize = plaintext.length;
-  const rawfilemd5 = crypto.createHash("md5").update(plaintext).digest("hex");
   const filesize = aesEcbPaddedSize(rawsize);
+  const rawfilemd5 = crypto.createHash("md5").update(plaintext).digest("hex");
   const filekey = randomFileKey();
   const aeskey = randomAesKey();
-
-  log.debug(`${label}`, { file: filePath, rawsize, filesize, md5: rawfilemd5, filekey });
-
   const uploadUrlResp = await getUploadUrl({
-    baseUrl: opts.baseUrl,
-    token: opts.token,
-    filekey,
-    media_type: mediaType,
-    to_user_id: toUserId,
-    rawsize,
-    rawfilemd5,
-    filesize,
-    no_need_thumb: true,
-    aeskey: aeskey.toString("hex"),
-    routeTag: opts.routeTag,
+    baseUrl: opts.baseUrl, token: opts.token, routeTag: opts.routeTag, timeoutMs: opts.timeoutMs,
+    signal: opts.signal ?? opts.abortSignal, filekey, media_type: mediaType, to_user_id: toUserId,
+    rawsize, rawfilemd5, filesize, no_need_thumb: true, aeskey: aeskey.toString("hex"),
   });
-
-  const uploadParam = uploadUrlResp.upload_param;
-  if (!uploadParam) {
-    throw new Error(`${label}: getUploadUrl returned no upload_param: ${JSON.stringify(uploadUrlResp)}`);
+  if (!uploadUrlResp.upload_full_url && !uploadUrlResp.upload_param) {
+    throw new Error(`${label}: getUploadUrl returned no upload_full_url or upload_param`);
   }
-
   const downloadParam = await uploadBufferToCdn({
-    buf: plaintext,
-    uploadParam,
-    filekey,
-    cdnBaseUrl,
-    aeskey,
-    label: `${label}[filekey=${filekey}]`,
+    buf: plaintext, uploadParam: uploadUrlResp.upload_param,
+    uploadFullUrl: uploadUrlResp.upload_full_url, filekey, cdnBaseUrl, aeskey, label,
+    timeoutMs: opts.timeoutMs, signal: opts.signal ?? opts.abortSignal, maxBytes: limit,
   });
-
-  return new UploadedFileInfo({
-    filekey,
-    downloadEncryptedQueryParam: downloadParam,
-    aeskey: aeskey.toString("hex"),
-    fileSize: rawsize,
-    fileSizeCiphertext: filesize,
-  });
+  return new UploadedFileInfo({ filekey, downloadEncryptedQueryParam: downloadParam,
+    aeskey: aeskey.toString("hex"), fileSize: rawsize, fileSizeCiphertext: filesize });
 }
 
-/** 上传图片。 */
-export function uploadImage({ filePath, toUserId, opts, cdnBaseUrl = CDN_BASE_URL }) {
-  return uploadMediaToCdn({ filePath, toUserId, opts, cdnBaseUrl, mediaType: UploadMediaType.IMAGE, label: "uploadImage" });
+async function uploadMediaToCdn(params) {
+  const plaintext = await readLocalMedia(params.filePath, byteLimit(params.maxBytes ?? params.opts?.maxBytes));
+  return uploadMediaBuffer({ ...params, plaintext });
 }
 
-/** 上传视频。 */
-export function uploadVideo({ filePath, toUserId, opts, cdnBaseUrl = CDN_BASE_URL }) {
-  return uploadMediaToCdn({ filePath, toUserId, opts, cdnBaseUrl, mediaType: UploadMediaType.VIDEO, label: "uploadVideo" });
+export function uploadImage(params) {
+  return uploadMediaToCdn({ cdnBaseUrl: CDN_BASE_URL, ...params, mediaType: UploadMediaType.IMAGE, label: "uploadImage" });
+}
+export function uploadVideo(params) {
+  return uploadMediaToCdn({ cdnBaseUrl: CDN_BASE_URL, ...params, mediaType: UploadMediaType.VIDEO, label: "uploadVideo" });
+}
+export function uploadFileAttachment(params) {
+  return uploadMediaToCdn({ cdnBaseUrl: CDN_BASE_URL, ...params, mediaType: UploadMediaType.FILE, label: "uploadFileAttachment" });
+}
+export function uploadVoice(params) {
+  return uploadMediaToCdn({ cdnBaseUrl: CDN_BASE_URL, ...params, mediaType: UploadMediaType.VOICE, label: "uploadVoice" });
 }
 
-/** 上传文件附件（非图片/视频）。 */
-export function uploadFileAttachment({ filePath, toUserId, opts, cdnBaseUrl = CDN_BASE_URL }) {
-  return uploadMediaToCdn({ filePath, toUserId, opts, cdnBaseUrl, mediaType: UploadMediaType.FILE, label: "uploadFileAttachment" });
+export async function uploadLocalFile(params) {
+  const mime = params.mimeType ?? getMimeFromFilename(params.filePath);
+  if (mime.startsWith("video/")) return uploadVideo(params);
+  if (mime.startsWith("image/")) return uploadImage(params);
+  if (mime === "audio/silk" || /\.silk$/i.test(params.filePath)) return uploadVoice(params);
+  return uploadFileAttachment(params);
 }
 
-/**
- * 按本地文件扩展名（MIME）路由到对应的上传函数。
- *   video/* → uploadVideo
- *   image/* → uploadImage
- *   else    → uploadFileAttachment
- */
-export async function uploadLocalFile({ filePath, toUserId, opts, cdnBaseUrl = CDN_BASE_URL }) {
-  const mime = getMimeFromFilename(filePath);
-  if (mime.startsWith("video/")) {
-    return uploadVideo({ filePath, toUserId, opts, cdnBaseUrl });
-  }
-  if (mime.startsWith("image/")) {
-    return uploadImage({ filePath, toUserId, opts, cdnBaseUrl });
-  }
-  return uploadFileAttachment({ filePath, toUserId, opts, cdnBaseUrl });
-}
-
-/**
- * 上传一个内存 Buffer 到 CDN（例如程序生成的图片/数据文件）。
- * 通过先写入临时文件再走 uploadMediaToCdn，保证 MD5/大小计算与文件上传一致。
- *
- * @param {Buffer} buf
- * @param {object} params
- * @param {string} params.ext - 临时文件扩展名（如 ".png"），影响 MIME 推断
- * @param {string} params.toUserId
- * @param {object} params.opts - { baseUrl, token, routeTag }
- * @param {string} [params.cdnBaseUrl]
- * @param {number} params.mediaType - UploadMediaType 值
- * @returns {Promise<UploadedFileInfo>}
- */
-export async function uploadBuffer({ buf, ext = ".bin", toUserId, opts, cdnBaseUrl = CDN_BASE_URL, mediaType }) {
-  const tmpDir = path.join(os.tmpdir(), "weixin-bot-upload");
-  await fs.mkdir(tmpDir, { recursive: true });
-  const filePath = path.join(tmpDir, tempFileName("weixin-buf", ext));
-  await fs.writeFile(filePath, buf);
-  try {
-    return await uploadMediaToCdn({
-      filePath,
-      toUserId,
-      opts,
-      cdnBaseUrl,
-      mediaType,
-      label: `uploadBuffer[type=${mediaType}]`,
-    });
-  } finally {
-    await fs.unlink(filePath).catch(() => {});
-  }
+/** Upload bytes directly, without writing a temporary file. */
+export async function uploadBuffer({ buf, toUserId, opts, cdnBaseUrl = CDN_BASE_URL, mediaType, maxBytes }) {
+  if (!Buffer.isBuffer(buf) && !(buf instanceof Uint8Array)) throw new Error("media buffer must be bytes");
+  assertSize(buf.byteLength, byteLimit(maxBytes ?? opts?.maxBytes));
+  return uploadMediaBuffer({ plaintext: Buffer.from(buf), toUserId, opts, cdnBaseUrl, mediaType, maxBytes, label: "uploadBuffer" });
 }
 
 // ---------------------------------------------------------------------------
@@ -376,26 +350,29 @@ export async function silkToWav(silkBuf) {
     log.debug(`silkToWav: decoded`, { durationMs: result.duration, pcmBytes: result.data.byteLength });
     return pcmBytesToWav(result.data, SILK_SAMPLE_RATE);
   } catch (err) {
-    log.warn(`silkToWav: transcode failed, will use raw silk`, { err: String(err) });
+    log.warn(`silkToWav: transcode failed, will use raw silk`);
     return null;
   }
 }
 
-// 保存到本地（供入站媒体持久化）
-/**
- * 将 buffer 保存到指定目录，返回完整路径。
- * 用于入站媒体下载后的持久化（应用层决定目录）。
- */
-export async function saveBufferToFile(buf, destDir, { ext = ".bin", prefix = "weixin-media", contentType, originalFilename } = {}) {
+/** Save incoming media under a safe, unique filename, stripping any supplied path components. */
+export async function saveBufferToFile(buf, destDir, { ext = ".bin", prefix = "weixin-media", originalFilename } = {}) {
+  assertSize(buf.byteLength, WEIXIN_MEDIA_MAX_BYTES);
   await fs.mkdir(destDir, { recursive: true });
-  let name;
-  if (originalFilename) {
-    name = `${prefix}-${Date.now()}-${originalFilename}`;
-  } else {
-    name = tempFileName(prefix, ext);
-  }
+  const safePrefix = String(prefix).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64) || "weixin-media";
+  const safeExt = /^\.[a-zA-Z0-9]{1,16}$/.test(ext) ? ext : ".bin";
+  let safeOriginal = typeof originalFilename === "string"
+    ? originalFilename.replace(/\\/g, "/").split("/").pop().replace(/[\x00-\x1f\x7f<>:"|?*]/g, "_").trim().slice(0, 128)
+    : "";
+  if (!safeOriginal || /^\.+$/.test(safeOriginal)) safeOriginal = "";
+  const name = safeOriginal ? `${tempFileName(safePrefix, "")}-${safeOriginal}` : tempFileName(safePrefix, safeExt);
   const filePath = path.join(destDir, name);
-  await fs.writeFile(filePath, buf);
+  try { await fs.writeFile(filePath, buf, { flag: "wx", mode: 0o600 }); }
+  catch (err) {
+    // wx prevents modifying an existing file. Clean up a newly-created partial write.
+    if (err.code !== "EEXIST") await fs.unlink(filePath).catch(() => {});
+    throw err;
+  }
   return filePath;
 }
 

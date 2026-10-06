@@ -1,34 +1,20 @@
-/**
- * iLink Bot HTTP 客户端
- *
- * 封装所有与 ilinkai.weixin.qq.com 的通信：
- *  - 统一请求头（Content-Type / AuthorizationType / X-WECHAT-UIN / Bearer）
- *  - base_info 自动注入
- *  - 超时与 AbortController
- *  - 错误分类（HTTP 错误 / API 业务错误 / Session 过期 / 超时）
- *
- * 与官方插件的 api 模块行为对齐，但去除了框架依赖。
- */
+/** iLink Bot API client, compatible with Tencent's official 2.4.9 client. */
 import {
   CHANNEL_VERSION,
   DEFAULT_API_TIMEOUT_MS,
+  DEFAULT_BOT_AGENT,
   DEFAULT_CONFIG_TIMEOUT_MS,
   DEFAULT_LONG_POLL_TIMEOUT_MS,
+  ILINK_APP_CLIENT_VERSION,
+  ILINK_APP_ID,
   SESSION_EXPIRED_ERRCODE,
 } from "./constants.mjs";
-import {
-  ensureTrailingSlash,
-  log,
-  randomWechatUin,
-  redactBody,
-  redactUrl,
-} from "./util.mjs";
+import { ensureTrailingSlash, log, randomWechatUin, redactBody, redactUrl } from "./util.mjs";
+import { parseJsonLossless } from "./json.mjs";
 
-// ---------------------------------------------------------------------------
-// 自定义错误类型
-// ---------------------------------------------------------------------------
+export { parseJsonLossless, parseWeixinApiJson } from "./json.mjs";
 
-/** HTTP 层错误（非 2xx 状态码）。 */
+/** HTTP status / malformed-response error. Sensitive response content is omitted. */
 export class WeixinHttpError extends Error {
   constructor(message, { status, endpoint, body } = {}) {
     super(message);
@@ -39,7 +25,6 @@ export class WeixinHttpError extends Error {
   }
 }
 
-/** API 业务错误（ret !== 0 或 errcode !== 0）。 */
 export class WeixinApiError extends Error {
   constructor(message, { ret, errcode, errmsg, endpoint } = {}) {
     super(message);
@@ -49,14 +34,12 @@ export class WeixinApiError extends Error {
     this.errmsg = errmsg;
     this.endpoint = endpoint;
   }
-
-  /** Session 是否过期（errcode=-14 或 ret=-14）。 */
   get isSessionExpired() {
     return this.errcode === SESSION_EXPIRED_ERRCODE || this.ret === SESSION_EXPIRED_ERRCODE;
   }
+  get isStaleToken() { return this.isSessionExpired; }
 }
 
-/** 请求超时（AbortError）。 */
 export class WeixinTimeoutError extends Error {
   constructor(message, { endpoint, timeoutMs } = {}) {
     super(message);
@@ -66,269 +49,225 @@ export class WeixinTimeoutError extends Error {
   }
 }
 
-// ---------------------------------------------------------------------------
-// base_info
-// ---------------------------------------------------------------------------
-
-export function buildBaseInfo() {
-  return { channel_version: CHANNEL_VERSION };
+/** Safe network diagnostics without retaining URLs, query strings or tokens. */
+export class WeixinNetworkError extends Error {
+  constructor(message, { endpoint, type, code } = {}) {
+    super(message);
+    this.name = "WeixinNetworkError";
+    this.endpoint = endpoint;
+    this.type = type;
+    this.code = code;
+  }
 }
 
-// ---------------------------------------------------------------------------
-// 请求头构建
-// ---------------------------------------------------------------------------
+/** Major, minor and patch occupy one byte each, matching the official client. */
+export function buildClientVersion(version) {
+  const [major = 0, minor = 0, patch = 0] = String(version).split(".").map((part) => parseInt(part, 10));
+  return ((major & 0xff) << 16) | ((minor & 0xff) << 8) | (patch & 0xff);
+}
 
-/**
- * 构建请求头。每次请求生成新的 X-WECHAT-UIN（随机 uint32 → base64）防重放。
- */
-export function buildHeaders({ token, body, routeTag } = {}) {
+/** UA-style product tokens with optional ASCII comments; maximum 256 bytes. */
+export function sanitizeBotAgent(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return DEFAULT_BOT_AGENT;
+  const words = raw.trim().split(/\s+/);
+  const products = [];
+  for (let i = 0; i < words.length; i++) {
+    const product = words[i];
+    if (!/^[A-Za-z0-9_.-]{1,32}\/[A-Za-z0-9_.+-]{1,32}$/.test(product)) continue;
+    let accepted = product;
+    if (words[i + 1]?.startsWith("(")) {
+      let comment = words[++i];
+      while (!comment.endsWith(")") && i + 1 < words.length) comment += ` ${words[++i]}`;
+      const inner = comment.slice(1, -1);
+      if (comment.endsWith(")") && /^[\x20-\x27\x2a-\x7e]{1,64}$/.test(inner)) {
+        accepted += ` (${inner})`;
+      }
+    }
+    if (Buffer.byteLength([...products, accepted].join(" "), "utf8") > 256) break;
+    products.push(accepted);
+  }
+  return products.join(" ") || DEFAULT_BOT_AGENT;
+}
+
+export function buildBaseInfo({ botAgent = process.env.WEIXIN_BOT_AGENT } = {}) {
+  return { channel_version: CHANNEL_VERSION, bot_agent: sanitizeBotAgent(botAgent) };
+}
+
+/** Unauthenticated QR GET requests use only these shared application headers. */
+export function buildAppHeaders({ routeTag, appId = ILINK_APP_ID, clientVersion = ILINK_APP_CLIENT_VERSION } = {}) {
+  const headers = {
+    "iLink-App-Id": String(appId),
+    "iLink-App-ClientVersion": String(clientVersion),
+  };
+  if (routeTag) headers.SKRouteTag = String(routeTag);
+  return headers;
+}
+
+/** The fetch implementation computes Content-Length from the actual UTF-8 body. */
+export function buildHeaders({ token, routeTag, appId, clientVersion } = {}) {
   const headers = {
     "Content-Type": "application/json",
     AuthorizationType: "ilink_bot_token",
     "X-WECHAT-UIN": randomWechatUin(),
+    ...buildAppHeaders({ routeTag, appId, clientVersion }),
   };
-  if (body !== undefined) {
-    headers["Content-Length"] = String(Buffer.byteLength(body, "utf-8"));
-  }
-  if (token?.trim()) {
-    headers.Authorization = `Bearer ${token.trim()}`;
-  }
-  if (routeTag) {
-    headers.SKRouteTag = String(routeTag);
-  }
+  if (token?.trim()) headers.Authorization = `Bearer ${token.trim()}`;
   return headers;
 }
 
-// ---------------------------------------------------------------------------
-// 底层 fetch 封装
-// ---------------------------------------------------------------------------
+/** Network causes are inspected for classification, never copied into messages. */
+export function classifyFetchError(err) {
+  if (err?.name === "AbortError" || err instanceof WeixinTimeoutError) {
+    return { type: "timeout", description: "request timeout" };
+  }
+  const causes = [];
+  let current = err;
+  for (let depth = 0; current && depth < 6; depth++) {
+    causes.push(current);
+    current = current.cause;
+  }
+  const diagnostics = causes.map((cause) => `${cause?.code ?? ""} ${cause?.message ?? String(cause)}`).join(" ");
+  const code = causes.map((cause) => cause?.code).find((value) => typeof value === "string" && /^[A-Z0-9_]{1,80}$/.test(value));
+  const withCode = (type, description) => ({ type, description, ...(code ? { code } : {}) });
+  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(diagnostics)) return withCode("dns", "DNS resolution failed; check DNS configuration");
+  if (/ECONNREFUSED/i.test(diagnostics)) return withCode("tcp", "TCP connection refused");
+  if (/UND_ERR_CONNECT_TIMEOUT|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH/i.test(diagnostics)) return withCode("tcp", "TCP connection timeout or unreachable");
+  if (/UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT/i.test(diagnostics)) return withCode("timeout", "request timeout");
+  if (/SSL|TLS|CERT|UNABLE_TO_VERIFY|DEPTH_ZERO/i.test(diagnostics)) return withCode("tls", "TLS handshake error");
+  if (/UND_ERR_SOCKET|ECONNRESET|EPIPE/i.test(diagnostics)) return withCode("tcp", "TCP connection interrupted");
+  return { type: "unknown", description: "network request failed" };
+}
 
-/**
- * 通用 POST JSON 请求。
- *
- * @param {object} opts
- * @param {string} opts.baseUrl
- * @param {string} opts.endpoint - 形如 "ilink/bot/sendmessage"
- * @param {object} opts.body - 请求体对象（未序列化）
- * @param {string} [opts.token]
- * @param {number} [opts.timeoutMs]
- * @param {string} [opts.label] - 日志标签
- * @param {string} [opts.routeTag]
- * @param {boolean} [opts.injectBaseInfo=true] - 是否自动合并 base_info
- * @returns {Promise<object>} 解析后的 JSON 响应
- */
+function abortError() {
+  const err = new Error("request aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+function safeLabel(raw) {
+  // API labels are diagnostic identifiers, never a place to retain URL queries.
+  return String(raw || "iLink API").split("?")[0].replace(/[^A-Za-z0-9_./ -]/g, "").slice(0, 100);
+}
+
+function safeApiMessage(raw, token) {
+  if (!raw) return "";
+  // errmsg is arbitrary remote content; structured/token-containing responses
+  // are omitted entirely instead of relying on partial redaction.
+  const value = String(raw);
+  if ((token && value.includes(token.trim())) || /bearer\s|token|aes_?key|qrcode|https?:\/\/|[{}\[\]]/i.test(value)) return "[redacted]";
+  return redactBody(value, 160);
+}
+
+/** Timeout and external cancellation remain active while consuming the body. */
+async function fetchJson({ baseUrl, endpoint, method, headers, body, timeoutMs, label, signal, abortSignal }) {
+  const url = new URL(endpoint, ensureTrailingSlash(baseUrl)).toString();
+  const name = safeLabel(label ?? endpoint);
+  const external = abortSignal ?? signal;
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer;
+  const onAbort = () => controller.abort();
+  if (external?.aborted) throw abortError();
+  external?.addEventListener("abort", onAbort, { once: true });
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  }
+  log.debug(`${method} ${name}`, { url: redactUrl(url), ...(body === undefined ? {} : { bodyBytes: Buffer.byteLength(body) }) });
+  try {
+    const res = await fetch(url, { method, headers, ...(body === undefined ? {} : { body }), signal: controller.signal, redirect: "error" });
+    const rawText = await res.text();
+    // Covers implementations that resolve despite an abort during body reading.
+    if (external?.aborted) throw abortError();
+    if (timedOut) throw new WeixinTimeoutError(`${name}: timeout after ${timeoutMs}ms`, { endpoint: name, timeoutMs });
+    log.debug(`${name} status=${res.status}`, { responseBytes: Buffer.byteLength(rawText) });
+    if (!res.ok) {
+      throw new WeixinHttpError(`${name}: HTTP ${res.status}`, { status: res.status, endpoint: name, body: "[redacted]" });
+    }
+    try { return parseJsonLossless(rawText); } catch {
+      throw new WeixinHttpError(`${name}: response is not valid JSON`, { status: res.status, endpoint: name, body: "[redacted]" });
+    }
+  } catch (err) {
+    if (external?.aborted) throw abortError();
+    if (err instanceof WeixinHttpError || err instanceof WeixinTimeoutError) throw err;
+    if (timedOut || err?.name === "AbortError") {
+      throw new WeixinTimeoutError(`${name}: timeout after ${timeoutMs}ms`, { endpoint: name, timeoutMs });
+    }
+    const classified = classifyFetchError(err);
+    log.warn(`${name}: fetch failed`, classified);
+    throw new WeixinNetworkError(`${name}: ${classified.description}${classified.code ? ` (${classified.code})` : ""}`, { endpoint: name, ...classified });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    external?.removeEventListener("abort", onAbort);
+  }
+}
+
 export async function apiPost(opts) {
   const {
-    baseUrl,
-    endpoint,
-    body,
-    token,
-    timeoutMs = DEFAULT_API_TIMEOUT_MS,
-    label = endpoint,
-    routeTag,
-    injectBaseInfo = true,
+    baseUrl, endpoint, body = {}, token, routeTag,
+    timeoutMs = DEFAULT_API_TIMEOUT_MS, label = endpoint,
+    injectBaseInfo = true, allowApiError = false,
+    extraHeaders = {}, signal, abortSignal, botAgent,
   } = opts;
-
-  const payload = injectBaseInfo ? { ...body, base_info: buildBaseInfo() } : body;
-  const bodyStr = JSON.stringify(payload);
-  const url = new URL(endpoint, ensureTrailingSlash(baseUrl)).toString();
-
-  const headers = buildHeaders({ token, body: bodyStr, routeTag });
-  log.debug(`POST ${label}`, { url: redactUrl(url), body: redactBody(bodyStr) });
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res;
-  try {
-    res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: bodyStr,
-      signal: controller.signal,
-    });
-  } catch (err) {
-    clearTimeout(timer);
-    if (err.name === "AbortError") {
-      throw new WeixinTimeoutError(`${label}: timeout after ${timeoutMs}ms`, { endpoint: label, timeoutMs });
+  const payload = injectBaseInfo ? { ...body, base_info: buildBaseInfo({ botAgent }) } : body;
+  const response = await fetchJson({
+    baseUrl, endpoint, method: "POST", timeoutMs, label, signal, abortSignal,
+    headers: { ...buildHeaders({ token, routeTag }), ...extraHeaders },
+    body: JSON.stringify(payload),
+  });
+  if (!allowApiError && response && typeof response === "object") {
+    const { ret, errcode } = response;
+    if ((ret !== undefined && ret !== 0) || (errcode !== undefined && errcode !== 0)) {
+      const errmsg = safeApiMessage(response.errmsg, token);
+      throw new WeixinApiError(`${safeLabel(label)}: ret=${ret} errcode=${errcode} errmsg=${errmsg}`, { ret, errcode, errmsg, endpoint: safeLabel(label) });
     }
-    throw err;
   }
-  clearTimeout(timer);
-
-  const rawText = await res.text();
-  log.debug(`${label} status=${res.status}`, { raw: redactBody(rawText) });
-
-  if (!res.ok) {
-    throw new WeixinHttpError(`${label} HTTP ${res.status}: ${rawText}`, {
-      status: res.status,
-      endpoint: label,
-      body: rawText,
-    });
-  }
-
-  let resp;
-  try {
-    resp = JSON.parse(rawText);
-  } catch {
-    throw new WeixinHttpError(`${label}: response is not valid JSON: ${rawText}`, {
-      status: res.status,
-      endpoint: label,
-      body: rawText,
-    });
-  }
-
-  // 统一业务错误检测：ret !== 0 或 errcode !== 0
-  const ret = resp.ret;
-  const errcode = resp.errcode;
-  const isApiError = (ret !== undefined && ret !== 0) || (errcode !== undefined && errcode !== 0);
-  if (isApiError) {
-    throw new WeixinApiError(
-      `${label}: ret=${ret} errcode=${errcode} errmsg=${resp.errmsg ?? ""}`,
-      { ret, errcode, errmsg: resp.errmsg, endpoint: label },
-    );
-  }
-
-  return resp;
+  return response;
 }
 
-/**
- * 通用 GET 请求（用于 QR 码相关接口，它们是 GET）。
- */
-export async function apiGet(opts) {
-  const {
-    baseUrl,
-    path,
-    token,
-    timeoutMs = DEFAULT_API_TIMEOUT_MS,
-    label = path,
-    routeTag,
-    extraHeaders = {},
-  } = opts;
-
-  const url = new URL(path, ensureTrailingSlash(baseUrl)).toString();
-  const headers = { ...extraHeaders };
+/** GET preserves business/status response fields for the login state machine. */
+export function apiGet({ baseUrl, path, endpoint = path, token, timeoutMs = DEFAULT_API_TIMEOUT_MS, label = endpoint, routeTag, extraHeaders = {}, signal, abortSignal } = {}) {
+  const headers = { ...buildAppHeaders({ routeTag }), ...extraHeaders };
   if (token?.trim()) headers.Authorization = `Bearer ${token.trim()}`;
-  if (routeTag) headers.SKRouteTag = String(routeTag);
-
-  log.debug(`GET ${label}`, { url: redactUrl(url) });
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res;
-  try {
-    res = await fetch(url, { method: "GET", headers, signal: controller.signal });
-  } catch (err) {
-    clearTimeout(timer);
-    if (err.name === "AbortError") {
-      throw new WeixinTimeoutError(`${label}: timeout after ${timeoutMs}ms`, { endpoint: label, timeoutMs });
-    }
-    throw err;
-  }
-  clearTimeout(timer);
-
-  const rawText = await res.text();
-  log.debug(`${label} status=${res.status}`, { raw: redactBody(rawText) });
-
-  if (!res.ok) {
-    throw new WeixinHttpError(`${label} HTTP ${res.status}: ${rawText}`, {
-      status: res.status,
-      endpoint: label,
-      body: rawText,
-    });
-  }
-  return JSON.parse(rawText);
+  return fetchJson({ baseUrl, endpoint, method: "GET", timeoutMs, label, headers, signal, abortSignal });
 }
 
-// ---------------------------------------------------------------------------
-// 具体 API 封装
-// ---------------------------------------------------------------------------
-
-/**
- * 长轮询获取新消息。
- * 服务器会 hold 住连接直到有消息或超时。
- *
- * 客户端超时（AbortError）被特殊处理：返回 ret=0 的空响应，调用方可直接重试。
- * 这是长轮询的正常行为，不是错误。
- *
- * @returns {Promise<{ret:number, msgs:array, get_updates_buf:string, longpolling_timeout_ms?:number, errcode?:number, errmsg?:string}>}
- */
-export async function getUpdates({ baseUrl, token, getUpdatesBuf = "", timeoutMs = DEFAULT_LONG_POLL_TIMEOUT_MS, routeTag } = {}) {
+/** Internal timeout and external stop are normal long-poll control flow. */
+export async function getUpdates({ baseUrl, token, getUpdatesBuf = "", get_updates_buf, timeoutMs = DEFAULT_LONG_POLL_TIMEOUT_MS, routeTag, signal, abortSignal } = {}) {
+  const buf = get_updates_buf ?? getUpdatesBuf;
   try {
-    return await apiPost({
-      baseUrl,
-      endpoint: "ilink/bot/getupdates",
-      body: { get_updates_buf: getUpdatesBuf },
-      token,
-      timeoutMs,
-      label: "getUpdates",
-      routeTag,
-    });
+    return await apiPost({ baseUrl, endpoint: "ilink/bot/getupdates", body: { get_updates_buf: buf }, token, timeoutMs, label: "getUpdates", routeTag, signal, abortSignal });
   } catch (err) {
-    if (err instanceof WeixinTimeoutError) {
-      log.debug(`getUpdates: long-poll timeout (normal), returning empty response`);
-      return { ret: 0, msgs: [], get_updates_buf: getUpdatesBuf };
+    if (err instanceof WeixinTimeoutError || err?.name === "AbortError") {
+      log.debug("getUpdates: long-poll ended without messages");
+      return { ret: 0, msgs: [], get_updates_buf: buf };
     }
     throw err;
   }
 }
 
-/** 获取 CDN 预签名上传地址。 */
-export function getUploadUrl({ baseUrl, token, ...req } = {}) {
-  return apiPost({
-    baseUrl,
-    endpoint: "ilink/bot/getuploadurl",
-    body: req,
-    token,
-    timeoutMs: DEFAULT_API_TIMEOUT_MS,
-    label: "getUploadUrl",
-  });
+export function getUploadUrl({ baseUrl, token, routeTag, timeoutMs = DEFAULT_API_TIMEOUT_MS, signal, abortSignal, ...req } = {}) {
+  return apiPost({ baseUrl, endpoint: "ilink/bot/getuploadurl", body: req, token, routeTag, timeoutMs, signal, abortSignal, label: "getUploadUrl" });
 }
 
-/** 发送消息（文字/图片/文件/视频/语音）。 */
-export function sendMessage({ baseUrl, token, msg, timeoutMs, routeTag } = {}) {
-  return apiPost({
-    baseUrl,
-    endpoint: "ilink/bot/sendmessage",
-    body: { msg },
-    token,
-    timeoutMs,
-    label: "sendMessage",
-    routeTag,
-  });
+export function sendMessage({ baseUrl, token, msg, timeoutMs, routeTag, signal, abortSignal } = {}) {
+  return apiPost({ baseUrl, endpoint: "ilink/bot/sendmessage", body: { msg }, token, timeoutMs, routeTag, signal, abortSignal, label: "sendMessage" });
 }
 
-/** 获取账号配置（含 typing_ticket）。 */
-export function getConfig({ baseUrl, token, ilinkUserId, contextToken, routeTag } = {}) {
-  return apiPost({
-    baseUrl,
-    endpoint: "ilink/bot/getconfig",
-    body: {
-      ilink_user_id: ilinkUserId,
-      context_token: contextToken,
-    },
-    token,
-    timeoutMs: DEFAULT_CONFIG_TIMEOUT_MS,
-    label: "getConfig",
-    routeTag,
-  });
+export function getConfig({ baseUrl, token, ilinkUserId, contextToken, routeTag, timeoutMs = DEFAULT_CONFIG_TIMEOUT_MS, signal, abortSignal } = {}) {
+  return apiPost({ baseUrl, endpoint: "ilink/bot/getconfig", body: { ilink_user_id: ilinkUserId, context_token: contextToken }, token, routeTag, timeoutMs, signal, abortSignal, label: "getConfig" });
 }
 
-/** 发送/取消"正在输入"状态。 */
-export function sendTyping({ baseUrl, token, ilinkUserId, typingTicket, status, routeTag } = {}) {
-  return apiPost({
-    baseUrl,
-    endpoint: "ilink/bot/sendtyping",
-    body: {
-      ilink_user_id: ilinkUserId,
-      typing_ticket: typingTicket,
-      status,
-    },
-    token,
-    timeoutMs: DEFAULT_CONFIG_TIMEOUT_MS,
-    label: "sendTyping",
-    routeTag,
-  });
+export function sendTyping({ baseUrl, token, ilinkUserId, typingTicket, status, routeTag, timeoutMs = DEFAULT_CONFIG_TIMEOUT_MS, signal, abortSignal } = {}) {
+  return apiPost({ baseUrl, endpoint: "ilink/bot/sendtyping", body: { ilink_user_id: ilinkUserId, typing_ticket: typingTicket, status }, token, routeTag, timeoutMs, signal, abortSignal, label: "sendTyping" });
 }
 
-// 暴露内部 fetch 包装，供 auth.mjs 复用
+export function notifyStart({ baseUrl, token, routeTag, timeoutMs = DEFAULT_CONFIG_TIMEOUT_MS, signal, abortSignal } = {}) {
+  return apiPost({ baseUrl, endpoint: "ilink/bot/msg/notifystart", body: {}, token, routeTag, timeoutMs, signal, abortSignal, label: "notifyStart" });
+}
+
+/** Call without the stopped polling signal so the notification can finish. */
+export function notifyStop({ baseUrl, token, routeTag, timeoutMs = DEFAULT_CONFIG_TIMEOUT_MS, signal, abortSignal } = {}) {
+  return apiPost({ baseUrl, endpoint: "ilink/bot/msg/notifystop", body: {}, token, routeTag, timeoutMs, signal, abortSignal, label: "notifyStop" });
+}
+
 export { apiPost as _apiPost, apiGet as _apiGet };

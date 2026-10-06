@@ -124,6 +124,7 @@ export function createTypingController(opts) {
       timer = setInterval(() => {
         if (running) send(TypingStatus.TYPING).catch(() => {});
       }, keepaliveIntervalMs);
+      timer.unref();
     },
     async stop() {
       running = false;

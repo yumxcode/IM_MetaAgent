@@ -26,7 +26,7 @@ const require = createRequire(import.meta.url);
 try { require("dotenv").config(); } catch {}
 
 import { WeixinBot, log } from "./src/index.mjs";
-import { installProcessGuards } from "./src/process-guard.mjs";
+import { installProcessGuards, installGracefulShutdown } from "./src/process-guard.mjs";
 
 // Claude Agent SDK 是可选依赖：未安装时降级为回声模式
 let queryClaude = null;
@@ -104,9 +104,10 @@ async function main() {
   // 登录：无账号或 --login 时扫码
   const existing = bot.listAccounts();
   if (forceLogin || !existing.length) {
-    await bot.login();
+    const result = await bot.login();
+    if (result.connected === false) { console.error(result.message); process.exitCode = 1; return; }
   } else {
-    bot.setDefaultAccount(existing[0]);
+    bot.setDefaultAccount(bot.getDefaultAccount());
     const info = bot.getAccountInfo();
     console.log(`✅ 已加载账号 ${info.accountId}（保存于 ${info.savedAt}）`);
     if (info.paused) {
@@ -163,6 +164,7 @@ async function main() {
 
   // 启动长轮询（阻塞）
   console.log("🚀 开始监听消息（Ctrl+C 退出）...\n");
+  installGracefulShutdown(bot);
   await bot.start();
 }
 
