@@ -41,6 +41,15 @@ function parseWorkspaces(raw) {
 }
 
 /**
+ * The runtime treats `workspaces` with truthiness (an empty array scopes the
+ * console to ZERO workspaces — no tasks, no studios), so an unset or empty
+ * selection MUST stay undefined, mirroring `tasks --agentic`'s `-w` handling.
+ */
+function normalizeWorkspaces(value) {
+  return Array.isArray(value) && value.length ? value : undefined;
+}
+
+/**
  * WeChat adapter for the runtime's `tasks --agentic` console.
  *
  * One chat message = one console turn inside TasksAgenticSessionStore.use(), so
@@ -53,7 +62,7 @@ export function createTasksAgenticConsole(opts = {}) {
   const bin = opts.bin ?? env.META_AGENT_TASKS_BIN ?? 'meta-agent-glm';
   const runtimeDir = opts.runtimeDir ?? env.META_AGENT_TASKS_RUNTIME_DIR;
   const profile = resolveTasksProfile(env, opts);
-  const workspaces = opts.workspaces ?? parseWorkspaces(env.META_AGENT_TASKS_WORKSPACES);
+  const workspaces = normalizeWorkspaces(opts.workspaces ?? parseWorkspaces(env.META_AGENT_TASKS_WORKSPACES));
   const home = resolveMetaAgentHome(env);
   const opsRoot = opts.opsRoot ?? (env.META_AGENT_TASKS_OPS_ROOT?.trim() || join(home, 'task-ops', 'weixin'));
   const maxRunning = parsePositiveInt(opts.maxRunning ?? env.META_AGENT_TASKS_MAX_RUNNING, 3, { max: 64 });

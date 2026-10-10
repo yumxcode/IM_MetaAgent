@@ -101,7 +101,14 @@ function fixture({ resumed = true, rotated = false, consoleOptions = {} } = {}) 
   }
 
   class FakeService {
-    constructor(options) { calls.serviceOptions.push(options); }
+    constructor(options) {
+      // The runtime scopes by TRUTHINESS: an empty-array workspaces option means
+      // "zero workspaces" (no tasks, no studios) — it must never be sent.
+      if (Array.isArray(options.workspaces) && options.workspaces.length === 0) {
+        throw new Error("TaskControlService must not receive an empty workspaces array");
+      }
+      calls.serviceOptions.push(options);
+    }
     async list(input) {
       calls.listCalls.push(input);
       return { snapshotId: "snap", total: 1, nextCursor: null,
@@ -142,12 +149,13 @@ function fixture({ resumed = true, rotated = false, consoleOptions = {} } = {}) 
     },
   };
 
+  const { env: extraEnv, ...restOptions } = consoleOptions;
   const console_ = createTasksAgenticConsole({
     bin: "/fake/meta-agent-glm",
     profile: "/test/glm_config.json",
-    env: { META_AGENT_HOME: "/test/home" },
+    env: { META_AGENT_HOME: "/test/home", ...extraEnv },
     loadRuntime: async () => runtime,
-    ...consoleOptions,
+    ...restOptions,
   });
   return { calls, console_, block(next) { blockTurn = next; } };
 }
@@ -178,6 +186,19 @@ test("a turn mirrors the runtime console: snapshot aliases, save, dispose, joine
   // The console lives in its own root, isolated from the terminal console.
   assert.equal(f.calls.storeArgs.root, "/test/home/task-ops/weixin");
   assert.equal(f.calls.serviceOptions[0].principal, "scope-x");
+  // Regression: unset/empty scope must stay undefined, never an empty array.
+  assert.equal(f.calls.serviceOptions[0].workspaces, undefined);
+  assert.equal(f.calls.storeArgs.scope.workspaces, undefined);
+});
+
+test("an explicit workspaces scope flows through and empty values stay unscoped", async () => {
+  const scoped = fixture({ consoleOptions: { workspaces: ["/w/one", "/w/two"] } });
+  await scoped.console_.turn("查看任务");
+  assert.deepEqual(scoped.calls.serviceOptions[0].workspaces, ["/w/one", "/w/two"]);
+
+  const blank = fixture({ consoleOptions: { env: { META_AGENT_TASKS_WORKSPACES: " , " } } });
+  await blank.console_.turn("查看任务");
+  assert.equal(blank.calls.serviceOptions[0].workspaces, undefined);
 });
 
 test("a bare /tasks turn uses a sensible default prompt and announces the 24h session once", async () => {
