@@ -19,3 +19,11 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Versioned release archives and local install state
+release/
+releases/
+shared/
+current
+previous
+.install-lock/

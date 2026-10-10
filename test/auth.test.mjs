@@ -273,17 +273,17 @@ test("legacy account and cursor files remain available after directory migration
 });
 
 test("fresh account credentials remain visible when quote storage initializes its canonical directory", async () => {
-  const { QuoteStore, resolveQuoteCachePolicy } = await import("../src/quote-store.mjs");
+  const { QuoteStore, resolveQuoteCachePolicy, isQuoteCacheAvailable } = await import("../src/quote-store.mjs");
   const saved = auth.saveAccount("fresh", { token: "fresh-token" });
   assert.equal(fs.existsSync(path.join(stateDir, "weixin-bot", "accounts", "fresh.json")), true);
   assert.equal(fs.existsSync(path.join(stateDir, "openclaw-weixin")), false);
   const store = await QuoteStore.open({ policy: resolveQuoteCachePolicy({}) });
-  assert.ok(store);
+  if (isQuoteCacheAvailable()) assert.ok(store); else assert.equal(store, null);
   try {
     assert.deepEqual(auth.loadAccount("fresh"), saved);
     assert.equal(auth.resolveAccount({ accountId: "fresh" }).token, "fresh-token");
   } finally {
-    store.close();
+    store?.close();
   }
 });
 

@@ -35,7 +35,9 @@
 ## 快速开始
 
 ### 环境要求
-- Node.js **≥ 22**（用内置 `fetch` / `crypto` / `AbortController`）
+- Node.js **≥ 20.18**（用内置 `fetch` / `crypto` / `AbortController`）
+
+Node 20 可运行微信收发、媒体、任务查询和管理；历史引用缓存依赖内置 SQLite，仅在 Node ≥ 22.13 时启用，Node 20 自动关闭该可选缓存。
 
 ### 安装
 
@@ -45,7 +47,9 @@ cd IM_MetaAgent
 npm install
 ```
 
-`npm install` 安装必需依赖 `dotenv`，并尝试安装 `qrcode-terminal`、`silk-wasm`、`@anthropic-ai/claude-agent-sdk` 和 `@meta-agent/runtime` 等可选依赖。`packages/` 是官方发布包的参考副本，不加入 npm workspaces，安装独立桥接不会拉入 OpenClaw。运行 `npm test` 验证独立接入层；`npm run build` 对 ESM 入口和模块做语法检查，无需编译。
+`npm install` 安装必需依赖 `dotenv`，并尝试安装 `qrcode-terminal`、`silk-wasm`和 `@anthropic-ai/claude-agent-sdk` 等可选依赖。`packages/` 是官方发布包的参考副本，不加入 npm workspaces，安装独立桥接不会拉入 OpenClaw。运行 `npm test` 验证独立接入层；`npm run build` 对 ESM 入口和模块做语法检查，无需编译。
+
+发布包安装、保留配置更新与回滚见 [`INSTALL.md`](./INSTALL.md)。发布包不安装 meta-agent runtime；后端使用服务器已有的独立安装。
 
 ### 三步跑通 meta-agent 桥接
 
@@ -74,50 +78,45 @@ npm start         # 收到任何文本原样回复，验证收发链路
 
 完整 CLI 命令（`check` / `accounts` / `logout` 等）见 [`README-standalone.md`](./README-standalone.md#快速开始)。
 
-## 在微信查看和管理 GLM 任务
+## 在微信查看和管理 GLM 任务（tasks --agentic）
 
-启动桥接后，在微信发送 `/tasks`。它读取本机任务存储，默认只显示 GLM 配置对应的任务；查看任务不会启动调度器，也不会新建 Agent 会话。
+启动桥接后，在微信发送 `/tasks <自然语言>`。它桥接 meta-agent runtime 的 `tasks --agentic` 运维控制台：由运维模型先读取任务快照再回答或操作，支持多轮追问，无需记忆固定命令语法。
 
-任务管理需要 meta-agent runtime **≥ 0.11.1**。运行 `npm run agent:tasks-check`（等价于 `node weixin-meta-agent.mjs --tasks-check`）可只读检查后端、配置和任务列表，无需连接微信。
+任务运维需要 meta-agent runtime **≥ 0.11.3**。运行 `npm run agent:tasks-check`（等价于 `node weixin-meta-agent.mjs --tasks-check`）可只读检查后端与任务列表，无需连接微信、不调用模型。
 
 ```text
-/tasks running                    查看运行中的任务和项目
-/tasks recent                     查看最近更新
-/tasks projects                   按项目汇总任务
-/tasks show 1                     查看上一次列表中第 1 个任务
-/tasks progress 1                 查看最近进展和恢复检查点
-/tasks logs 1 30                  查看最近 30 条托管活动
-/tasks report 1                   读取任务报告
-/tasks artifacts 1                列出产物
-/tasks run-now 1                  请求立即调度
-/tasks steer 1 继续完成剩余测试      给任务追加指令
-/tasks cancel 1                   取消排队执行
-/tasks kill 1                     请求终止，按回复中的令牌确认
-/tasks rm 1                       请求删除任务记录，按令牌确认
-/tasks confirm <令牌>              确认终止或删除（60 秒内有效）
-/tasks manage start 3              启动调度器，最多运行 3 个任务
-/tasks manage status               查看调度器状态
-/tasks manage stop                 停止接收新任务，当前轮次继续执行
-/tasks help                        查看完整帮助
+/tasks                          查看当前任务概览
+/tasks 运行中的任务有哪些         自然语言查询
+/tasks 看下第 1 个任务的详情和最近日志
+/tasks 让它立即跑一轮             请求执行一次已到期的唤醒
+/tasks 给它追加指令：先跑测试再提交   给任务写入纠偏指令
+/tasks 上次运行的结果怎么样了       结合快照与活动日志回答
 ```
 
-`/tasks list` 显示任务列表，`/tasks active` 显示活跃任务。任务可用 ID、最近显示列表的序号或唯一项目名选择；多个匹配时会要求使用 ID，其他配置的任务不能被操作。确认令牌绑定微信账号、发送者、群聊和完整任务身份；终止还绑定当前轮次，轮次改变需重新确认。
+能力与边界：
 
-私聊也支持“查看任务”“任务列表”“运行中的项目”“运行中的任务”“最近进展 [任务]”“查看进展 <任务>”。原有群聊自然语言触发策略保留用于兼容；当前官方通道请在私聊使用。全部命令都受 `WEIXIN_ALLOW_FROM` 白名单约束，查询在 Agent 忙碌时仍可使用。
+- 每轮回答前自动注入最新任务快照（含 T1/T2… 短别名，可直接说"让 T3 跑一轮"），运行/纠偏（`ops.task.run` / `ops.task.steer`）直接执行；查询不会启动无关任务。
+- **终止、删除、取消、Studio 生命周期**等高危操作不在微信侧授权——回复会指引到终端 `meta-agent-glm tasks --agentic` 确认执行（可用 `META_AGENT_TASKS_ALLOW_STUDIO_CONTROL=true` 放开 Studio 控制）。
+- 私聊也支持“查看任务”“任务列表”“运行中的项目”“运行中的任务”“最近进展 [任务]”“查看进展 <任务>”这些完整短语直达运维对话。全部指令受 `WEIXIN_ALLOW_FROM` 白名单约束，Agent 忙碌时仍可使用。
+
+**运维会话存储时间**：运维对话保存在 `TasksAgenticSessionStore` 中，**固定 24 小时有效期**（runtime 硬编码，不可延长）。过期后历史自动清空并新建会话，微信会在首次回复中提示“已续接/已新建/已过期重建”及到期时间；写操作的回执（receipts）持久保留，不受轮转影响。微信侧会话与终端控制台相互隔离（默认根目录 `~/.meta-agent/task-ops/weixin`），互不抢占。
 
 任务后端配置（均可省略，建议放 `.env`）：
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `META_AGENT_TASKS_BIN` | `meta-agent-glm` | 任务后端命令或可执行文件路径 |
-| `META_AGENT_TASKS_PROFILE` | `${META_AGENT_HOME}/glm_config.json`，未设 HOME 时为 `~/.meta-agent/glm_config.json` | 精确筛选任务配置；`all` 可查看全部配置 |
+| `META_AGENT_TASKS_PROFILE` | `~/.meta-agent/glm_config.json` | 运维会话的模型配置（也决定会话 scope） |
+| `META_AGENT_TASKS_WORKSPACES` | 全部 | 逗号分隔的绝对路径，限定控制台可见工作区 |
+| `META_AGENT_TASKS_MAX_TURNS` | `30` | 单轮运维对话的最大模型轮数 |
+| `META_AGENT_TASKS_MAX_BUDGET_USD` | `10` | 运维会话累计费用上限（24 小时内） |
+| `META_AGENT_TASKS_TURN_TIMEOUT_MS` | `300000` | 单条微信消息的超时，超时中断并保存进度；`0` 不限 |
+| `META_AGENT_TASKS_MAX_RUNNING` | `3` | 托管执行器并发上限（1–64） |
+| `META_AGENT_TASKS_OPS_ROOT` | `~/.meta-agent/task-ops/weixin` | 运维会话存储根目录 |
+| `META_AGENT_TASKS_ALLOW_STUDIO_CONTROL` | `false` | 是否允许微信侧执行 Studio 生命周期操作 |
 | `META_AGENT_TASKS_RUNTIME_DIR` | 自动发现 | 已安装的 meta-agent runtime 根目录 |
-| `META_AGENT_TASKS_MAX_RUNNING` | `3` | 调度器默认最大运行任务数 |
-| `META_AGENT_TASKS_POLL_MS` | `5000` | 调度检查间隔（毫秒，至少 `1000`） |
 
-这是 `tasks --manage` 的聊天入口：列表、详情、进展、日志、报告、产物和调度操作都有对应命令；终端的实时刷新、快捷键、交互选择器由聊天列表和任务选择参数替代。调度器只在显式 `manage start` 后启动，使用原有 TaskManager 和独立后台工作进程；重启桥接后需重新启动调度器。日志只展示已有的托管日志，检查点可能早于实时执行；缺少报告或日志时会明确提示，不推测进度。
-
-完整说明见 [`README-standalone.md`](./README-standalone.md#微信任务管理tasks-manage)。
+这是 `tasks --agentic` 的聊天入口：与终端控制台共用 TaskControlService / ops 工具 / 托管执行器（显式准入，不会自动跑到期任务）；模型配置沿用 `glm_config.json`，不会向工作进程转发控制器密钥。
 
 ## 仓库结构
 

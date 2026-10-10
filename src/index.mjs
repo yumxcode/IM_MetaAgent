@@ -2,7 +2,7 @@
  * WeixinBot —— 完备的微信 iLink Bot 接入层主类
  *
  * 设计目标：
- *  - 零框架依赖（仅依赖 Node.js >= 22.13 的内置 fetch / crypto）
+ *  - 零框架依赖（仅依赖 Node.js >= 20.18 的内置 fetch / crypto）
  *  - 事件驱动：bot.on('message' | 'media' | 'image' | 'voice' | 'file' | 'video' | 'error' | 'session-expired')
  *  - Promise 化：bot.sendText(...), bot.sendMedia(...)
  *  - 多账号：login(accountId?) / start(accountId?) / 多账号并存

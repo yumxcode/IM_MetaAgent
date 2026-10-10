@@ -4,7 +4,7 @@
 
 - **`src/`（本文件所述）**：独立的纯 ESM JavaScript 接入层，可直接 `import` 使用。
 - **`weixin-meta-agent.mjs`**：微信 ↔ meta-agent 桥接，在微信上远程调用本地 meta-agent 执行任务。
-- **微信任务管理**：使用 `/tasks` 查看和管理本机 `meta-agent-glm tasks` 的任务、项目与执行进展。
+- **微信任务管理**：使用 `/tasks <自然语言>` 通过 `tasks --agentic` 运维对话查询和管理本机任务。
 - **`packages/`**：腾讯官方插件代码（官方插件 2.4.9、安装器 2.1.4 的发布包参考副本，不作为 npm workspace）。
 
 
@@ -39,7 +39,7 @@
 ## 快速开始
 
 ### 环境要求
-- Node.js **≥ 22.13**（使用内置 `fetch`、`crypto`、`AbortController`；与 `package.json` 的 `engines` 一致）
+- Node.js **≥ 20.18**（使用内置 `fetch`、`crypto`、`AbortController`；与 `package.json` 的 `engines` 一致）
 - 无需任何外部框架
 
 ### 安装
@@ -55,7 +55,8 @@ npm install
 | `qrcode-terminal` | 终端渲染二维码（扫码登录） | 回退为打印二维码 URL，手动复制到浏览器扫码 |
 | `silk-wasm` | SILK 语音解码为 WAV | 回退为保存原始 SILK 文件 |
 | `@anthropic-ai/claude-agent-sdk` | 仅 Claude bridge demo 用 | demo 自动降级为回声模式 |
-| `@meta-agent/runtime` | GLM 任务查询/管理及 Agent 后端 | 可使用已安装的全局 runtime；缺失时任务功能给出明确错误 |
+
+meta-agent runtime 使用独立安装，不参与 IM 依赖安装。GLM 任务运维对话（tasks --agentic）要求 runtime ≥ 0.11.3；服务器部署、更新和回滚见 [`INSTALL.md`](./INSTALL.md)。
 
 ### 用 CLI 跑通「登录 + 验证」（推荐，零代码）
 
@@ -163,57 +164,30 @@ const r = await runMetaAgent("分析当前目录结构", {
 console.log(r.ok ? r.text : `失败: ${r.subtype}`);
 ```
 
-### 微信任务管理（tasks --manage）
+### 微信任务管理（tasks --agentic）
 
-`/tasks` 直接访问本机任务存储，默认使用 `meta-agent-glm` 后端并精确筛选 GLM 配置：任务的 `profile` 或调度配置中的 `configFile` 必须匹配目标配置。它能查看从终端发起的任务，也能查看微信托管的任务，与 `/p` 项目池和普通对话会话分别管理。
+`/tasks <自然语言>` 桥接 runtime 的 `tasks --agentic` 运维控制台：一个运维模型带着任务快照和 ops 工具（list / inspect / run / steer 等）处理你的消息，支持多轮追问。它能查看从终端发起的任务，也能操作微信托管的任务，与 `/p` 项目池和普通对话会话分别管理。
 
-任务后端需要 meta-agent runtime **≥ 0.11.1**。先运行 `npm run agent:tasks-check`，或 `node weixin-meta-agent.mjs --tasks-check`，只读检查后端版本、配置和任务查询；此检查无需微信连接，也不会启动调度器。
+任务后端需要 meta-agent runtime **≥ 0.11.3**。先运行 `npm run agent:tasks-check`，或 `node weixin-meta-agent.mjs --tasks-check`，只读检查后端版本与任务查询；此检查无需微信连接，也不调用模型。
 
-#### 查看任务与最近进展
+#### 用法
 
-| 微信命令 | 用途 |
-|---|---|
-| `/tasks`、`/tasks list` | 显示任务列表 |
-| `/tasks active` | 显示活跃任务 |
-| `/tasks running` | 查看运行中的任务及项目 |
-| `/tasks recent` | 按最近更新时间查看任务 |
-| `/tasks projects` | 按项目汇总任务 |
-| `/tasks show <任务>` | 查看状态、目标、项目和任务详情 |
-| `/tasks progress <任务>` | 查看最近进展、恢复检查点及可用执行信息 |
-| `/tasks logs <任务> [条数]` | 查看最近托管活动，默认 `10` 条，最多 `30` 条 |
-| `/tasks report <任务>` | 读取最近已完成轮次的报告，当前任务运行时也可查看 |
-| `/tasks artifacts <任务>` | 查看产物列表 |
-| `/tasks help` | 显示帮助 |
+```text
+/tasks                          查看当前任务概览
+/tasks 运行中的任务有哪些
+/tasks 看下第 1 个任务的详情和最近日志
+/tasks 让它立即跑一轮
+/tasks 给它追加指令：先跑测试再提交
+/tasks 上次运行的结果怎么样了
+```
 
-`<任务>` 可以是完整 ID、可唯一识别的 ID、最近显示列表中的序号，或只对应一个任务的项目名。序号绑定该微信账号和发送者最近显示的列表；出现多个匹配时请用 ID。筛选外的任务不能通过 ID 绕过配置隔离。
+每轮回答前自动注入最新任务快照（带 T1/T2… 短别名，可直接说"让 T3 跑一轮"），任务用完整 session ID 定位。运行（`ops.task.run`）与纠偏（`ops.task.steer`）直接执行；**终止、删除、取消、Studio 生命周期**等高危操作默认不在微信侧授权，回复会指引到终端 `meta-agent-glm tasks --agentic` 确认执行（`META_AGENT_TASKS_ALLOW_STUDIO_CONTROL=true` 可放开 Studio 控制）。
 
 私聊可直接发“查看任务”“任务列表”“运行中的项目”“运行中的任务”“最近进展 [任务]”或“查看进展 <任务>”。当前官方通道在私聊使用这些命令；原有群聊自然语言路由策略继续保留用于兼容。所有入口都先验证白名单；查询不占普通 Agent 请求的并发额度，自己的 Agent 正在运行时仍能查询。
 
-#### 在微信执行管理操作
+托管执行器复用 runtime 的 TaskManager（显式准入：不会自动执行到期任务，只响应"让它跑一轮"这类请求），通过独立后台工作进程执行；工作进程读取自己的 provider 配置，不转发控制器密钥。单条消息默认最长 5 分钟（`META_AGENT_TASKS_TURN_TIMEOUT_MS`），超时中断并保存进度。
 
-| 微信命令 | 用途 |
-|---|---|
-| `/tasks run-now <任务>` | 请求立即调度任务 |
-| `/tasks cancel <任务>` | 取消排队执行 |
-| `/tasks steer <任务> <指令>` | 为任务追加执行指令 |
-| `/tasks kill <任务>` | 请求终止任务，返回确认令牌 |
-| `/tasks rm <任务>` | 请求删除任务记录，返回确认令牌 |
-| `/tasks confirm <令牌>` | 确认上述终止或删除请求 |
-| `/tasks manage`、`/tasks manage status` | 查看调度器状态 |
-| `/tasks manage start [最大运行数]` | 显式启动调度器 |
-| `/tasks manage stop` | 停止接收新任务，保留正在执行的轮次 |
-
-`kill` 和 `rm` 的确认令牌在 **60 秒**内有效，并绑定微信 Bot 账号、发送者、群聊和完整任务身份。`kill` 还绑定当前执行轮次；确认期间任务被替换、当前轮次改变或状态不再允许该操作时，原令牌不能继续使用。
-
-```text
-/tasks running
-/tasks progress 1
-/tasks logs 1 30
-/tasks steer 1 先完成当前修改，再运行测试
-/tasks manage start 3
-```
-
-调度器复用 runtime 的 TaskManager，通过独立后台工作进程执行任务。仅查看列表或状态不会启动调度器；`manage start` 才开始调度。`manage stop` 停止后续调度，已有轮次继续执行。调度状态不跨桥接重启恢复，重启后需要再次 `manage start`。
+**运维会话存储时间**：运维对话固定 **24 小时**有效（runtime 硬编码）。过期后历史自动清空并新建会话，微信首次回复会提示已续接/已新建/已过期重建及到期时间；写操作回执持久保留。微信侧会话与终端控制台隔离存储（默认 `~/.meta-agent/task-ops/weixin`），互不抢占。
 
 #### 后端配置
 
@@ -222,26 +196,21 @@ console.log(r.ok ? r.text : `失败: ${r.subtype}`);
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `META_AGENT_TASKS_BIN` | `meta-agent-glm` | 后端命令或可执行文件路径 |
-| `META_AGENT_TASKS_PROFILE` | `${META_AGENT_HOME}/glm_config.json`，未设 HOME 时为 `~/.meta-agent/glm_config.json` | 精确匹配任务的配置路径；设为 `all` 时查看全部配置 |
-| `META_AGENT_TASKS_RUNTIME_DIR` | 自动发现 | 已安装的 runtime 根目录，用于加载任务管理能力 |
-| `META_AGENT_TASKS_MAX_RUNNING` | `3` | `manage start` 未指定参数时的最大运行任务数 |
-| `META_AGENT_TASKS_POLL_MS` | `5000` | 调度检查间隔（毫秒，至少 `1000`） |
+| `META_AGENT_TASKS_PROFILE` | `~/.meta-agent/glm_config.json` | 运维会话的模型配置（同时决定会话 scope） |
+| `META_AGENT_TASKS_WORKSPACES` | 全部 | 逗号分隔的绝对路径，限定控制台可见工作区 |
+| `META_AGENT_TASKS_MAX_TURNS` | `30` | 单轮运维对话的最大模型轮数 |
+| `META_AGENT_TASKS_MAX_BUDGET_USD` | `10` | 运维会话累计费用上限（24 小时内） |
+| `META_AGENT_TASKS_TURN_TIMEOUT_MS` | `300000` | 单条消息超时（毫秒），`0` 不限 |
+| `META_AGENT_TASKS_MAX_RUNNING` | `3` | 托管执行器并发上限（1–64） |
+| `META_AGENT_TASKS_OPS_ROOT` | `~/.meta-agent/task-ops/weixin` | 运维会话存储根目录 |
+| `META_AGENT_TASKS_ALLOW_STUDIO_CONTROL` | `false` | 允许微信侧执行 Studio 生命周期操作 |
+| `META_AGENT_TASKS_RUNTIME_DIR` | 自动发现 | 已安装的 runtime 根目录，用于加载运维能力 |
 
 此配置只影响 `/tasks`，普通微信对话仍使用原来的 `meta-agent` CLI 和项目会话。
 
-#### 与终端 tasks --manage 的对应关系
+#### 与终端 tasks --agentic 的对应关系
 
-| 终端能力 | 微信入口 |
-|---|---|
-| 任务列表、运行状态、项目概览 | `list`、`active`、`running`、`recent`、`projects` |
-| 任务详情、恢复检查点 | `show`、`progress` |
-| 日志、报告、产物 | `logs`、`report`、`artifacts` |
-| 立即执行、取消排队、追加指令 | `run-now`、`cancel`、`steer` |
-| 终止、删除 | `kill`、`rm`，然后 `confirm` |
-| 启动与停止调度 | `manage start`、`manage stop`、`manage status` |
-| 实时刷屏、快捷键、交互选择器 | 聊天按需查询，通过 ID 或列表序号选择 |
-
-微信展示已有记录，不推测进度。日志只在任务拥有托管日志时可读取；终端直接运行的任务可能没有该日志。报告尚未生成时会明确提示。恢复检查点是落盘快照，可能早于当前实时执行；以回复中的时间、状态和已有日志判断新旧。
+两者共用 TaskControlService、ops 工具和操作回执；微信侧是"每条消息一轮"的对话形态，终端是交互式 REPL（另有 `r T2` / `s T1 <纠偏>` 快捷指令）。微信侧不提供终端的高危操作确认（kill / rm / cancel / Studio 生命周期请在终端执行）。
 
 ### 按消息类型分别处理
 
@@ -506,7 +475,7 @@ const uploaded = await uploadVoice({ filePath: "/tmp/audio.silk", toUserId, opts
 
 源码与字段说明见 [本项目协议说明](./weixin-bot-api.md)、[腾讯官方协议文档](https://github.com/Tencent/openclaw-weixin/blob/main/docs/protocol_zh_CN.md) 和 [腾讯官方变更日志](https://github.com/Tencent/openclaw-weixin/blob/main/CHANGELOG.zh_CN.md)。
 
-新版接入层推荐 Node.js 22.13 及以上，以支持内置 SQLite 引用缓存。缓存默认保留文本 30 天、每账号 10,000 条，媒体 7 天、每账号 256 MiB、单文件 25 MiB。设置 `WEIXIN_QUOTE_CACHE_ENABLED=false` 可关闭，或在 `new WeixinBot({ quoteCache: { enabled: false } })` 中配置；SQLite 不可用时记录提示并继续接收消息。缓存引用只补充 Agent 上下文，任务指令始终按当前用户消息解析。
+独立接入层支持 Node.js 20.18 及以上。Node 20 缺少内置 SQLite，历史引用缓存自动关闭；微信收发、媒体及任务功能继续运行，消息中直接携带的引用文本仍可解析。Node.js 22.13 及以上可使用内置 SQLite 引用缓存。缓存默认保留文本 30 天、每账号 10,000 条，媒体 7 天、每账号 256 MiB、单文件 25 MiB。设置 `WEIXIN_QUOTE_CACHE_ENABLED=false` 可关闭，或在 `new WeixinBot({ quoteCache: { enabled: false } })` 中配置；SQLite 不可用时记录提示并继续接收消息。缓存引用只补充 Agent 上下文，任务指令始终按当前用户消息解析。
 
 `bot.sendVoiceFile({ to, filePath, contextToken })` 发送本地 SILK V3 文件。`bot.sendToolProgress({ to, toolName, toolCallId, status, runId, contextToken })` 发送官方工具进度：省略 `status` 表示开始，`completed` / `failed` 表示结束。主桥接会自动把工具事件和最终回复关联到相同 `run_id`，设置 `WEIXIN_REPLY_PROGRESS_MESSAGES=false` 可关闭工具进度。
 

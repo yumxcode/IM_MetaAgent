@@ -46,6 +46,11 @@ if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
   exit 1
 fi
 
+if ! "$NODE_BIN" --input-type=module -e 'import { assertSupportedNode } from "./src/node-support.mjs"; try { assertSupportedNode(); } catch (err) { console.error(err.message); process.exit(1); }'; then
+  echo "[start.sh] FATAL: Node.js >= 20.18 required." >&2
+  exit 1
+fi
+
 echo "[start.sh] $(date '+%Y-%m-%dT%H:%M:%S') starting: ${NODE_BIN} weixin-meta-agent.mjs (PATH meta-agent: $(command -v meta-agent 2>/dev/null || echo '未找到'))"
 
 # exec 替换进程，让守护工具直接管理 node（收到 SIGTERM 能优雅退出）

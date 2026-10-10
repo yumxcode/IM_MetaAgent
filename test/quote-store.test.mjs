@@ -4,9 +4,11 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { QuoteStore, resolveQuoteCachePolicy, resolveQuoteMediaSubdir } from "../src/quote-store.mjs";
+import { QuoteStore, resolveQuoteCachePolicy, resolveQuoteMediaSubdir, isQuoteCacheAvailable } from "../src/quote-store.mjs";
 import { resolvePartialQuote } from "../src/partial-quote.mjs";
 import { parseJsonLossless } from "../src/json.mjs";
+
+const sqliteTest = (name, fn) => test(name, { skip: !isQuoteCacheAvailable() && "requires native SQLite" }, fn);
 
 let temporary;
 let rootDir;
@@ -68,7 +70,25 @@ test("disabled quote store creates no database or media directories", async () =
   assert.equal(fs.existsSync(mediaRoot), false);
 });
 
-test("same message ID is isolated by bot account and conversation", async () => {
+test("unavailable or disabled SQLite cache creates no directories and returns null", async () => {
+  const store = await QuoteStore.open({ rootDir, mediaRoot, policy: policy({ enabled: !isQuoteCacheAvailable() }) });
+  assert.equal(store, null);
+  assert.equal(fs.existsSync(rootDir), false);
+  assert.equal(fs.existsSync(mediaRoot), false);
+});
+
+test("unavailable or disabled cache leaves existing database and media untouched", async () => {
+  fs.mkdirSync(rootDir, { recursive: true });
+  fs.mkdirSync(mediaRoot, { recursive: true });
+  const database = path.join(rootDir, "ref-messages.sqlite"), file = path.join(mediaRoot, "kept.png");
+  fs.writeFileSync(database, "existing database");
+  fs.writeFileSync(file, "existing media");
+  assert.equal(await QuoteStore.open({ rootDir, mediaRoot, policy: policy({ enabled: !isQuoteCacheAvailable() }) }), null);
+  assert.equal(fs.readFileSync(database, "utf8"), "existing database");
+  assert.equal(fs.readFileSync(file, "utf8"), "existing media");
+});
+
+sqliteTest("same message ID is isolated by bot account and conversation", async () => {
   const store = await open();
   await store.put(message({ body: "account-A/user-A" }));
   await store.put(message({ accountId: "bot-B", body: "account-B/user-A" }));
@@ -79,7 +99,7 @@ test("same message ID is isolated by bot account and conversation", async () => 
   assert.equal(store.find("bot-B", "user-B", "9007199254740993"), null);
 });
 
-test("adjacent unsafe uint64 message IDs survive JSON and SQLite without rounding", async () => {
+sqliteTest("adjacent unsafe uint64 message IDs survive JSON and SQLite without rounding", async () => {
   const store = await open();
   const parsed = parseJsonLossless('{"messages":[{"message_id":9007199254740992},{"message_id":9007199254740993},{"message_id":18446744073709551615}]}');
   const ids = ["9007199254740992", "9007199254740993", "18446744073709551615"];
@@ -91,7 +111,7 @@ test("adjacent unsafe uint64 message IDs survive JSON and SQLite without roundin
   }
 });
 
-test("quote cache persists across reopen with private database permissions", async () => {
+sqliteTest("quote cache persists across reopen with private database permissions", async () => {
   const original = await open();
   await original.put(message());
   original.close();
@@ -101,7 +121,7 @@ test("quote cache persists across reopen with private database permissions", asy
   assert.equal(fs.statSync(rootDir).mode & 0o777, 0o700);
 });
 
-test("message retention removes expired content and its orphaned managed media", async () => {
+sqliteTest("message retention removes expired content and its orphaned managed media", async () => {
   const store = await open({ retentionMs: 1000 });
   const file = media("bot-A", "old.png");
   await store.put(message({ sourceMediaPath: file, createdAt: Date.now() - 2000 }));
@@ -109,7 +129,7 @@ test("message retention removes expired content and its orphaned managed media",
   assert.equal(fs.existsSync(file), false);
 });
 
-test("garbage collection enforces message counts separately for each account", async () => {
+sqliteTest("garbage collection enforces message counts separately for each account", async () => {
   const store = await open({ maxMessagesPerAccount: 2 });
   const now = Date.now();
   for (const accountId of ["bot-A", "bot-B"]) {
@@ -124,7 +144,7 @@ test("garbage collection enforces message counts separately for each account", a
   }
 });
 
-test("media retention expires files while retaining referenced message text", async () => {
+sqliteTest("media retention expires files while retaining referenced message text", async () => {
   const store = await open({ retentionMs: 10_000, mediaRetentionMs: 1000 });
   const now = Date.now();
   const file = media("bot-A", "old-media.png");
@@ -136,7 +156,7 @@ test("media retention expires files while retaining referenced message text", as
   assert.equal(fs.existsSync(file), false);
 });
 
-test("media budget evicts oldest unique files and retains message text", async () => {
+sqliteTest("media budget evicts oldest unique files and retains message text", async () => {
   const store = await open({ maxMediaBytesPerAccount: 8, maxSingleMediaBytes: 8 });
   const files = [];
   for (let i = 0; i < 3; i++) {
@@ -151,7 +171,7 @@ test("media budget evicts oldest unique files and retains message text", async (
   assert.equal(store.listMedia("bot-A").reduce((sum, item) => sum + item.media_size, 0), 8);
 });
 
-test("duplicate references count media once and delete it only after the last reference", async () => {
+sqliteTest("duplicate references count media once and delete it only after the last reference", async () => {
   const store = await open({ maxMediaBytesPerAccount: 5 });
   const file = media("bot-A", "shared.png", "12345");
   await store.put(message({ messageId: "1", sourceMediaPath: file }));
@@ -163,7 +183,7 @@ test("duplicate references count media once and delete it only after the last re
   assert.equal(fs.existsSync(file), false);
 });
 
-test("unmanaged, oversized, or symlink-escaped media is never registered", async () => {
+sqliteTest("unmanaged, oversized, or symlink-escaped media is never registered", async () => {
   const store = await open({ maxSingleMediaBytes: 4 });
   const outside = path.join(temporary, "outside.png");
   fs.writeFileSync(outside, "abc");
@@ -178,7 +198,7 @@ test("unmanaged, oversized, or symlink-escaped media is never registered", async
   assert.equal(fs.existsSync(outside), true);
 });
 
-test("updating message body preserves an existing media reference", async () => {
+sqliteTest("updating message body preserves an existing media reference", async () => {
   const store = await open();
   const file = media("bot-A", "preserved.png");
   await store.put(message({ sourceMediaPath: file, mediaMime: "image/png" }));
@@ -189,7 +209,7 @@ test("updating message body preserves an existing media reference", async () => 
   assert.equal(found.mediaMime, "image/png");
 });
 
-test("replacing a cached media file immediately removes its orphaned predecessor", async () => {
+sqliteTest("replacing a cached media file immediately removes its orphaned predecessor", async () => {
   const store = await open({ maxMediaBytesPerAccount: 5 });
   const previous = media("bot-A", "previous.png", "12345");
   const replacement = media("bot-A", "replacement.png", "67890");
@@ -200,7 +220,7 @@ test("replacing a cached media file immediately removes its orphaned predecessor
   assert.equal(store.find("bot-A", "user-A", "9007199254740993").mediaPath, replacement);
 });
 
-test("replacing a shared media file retains it while another message still references it", async () => {
+sqliteTest("replacing a shared media file retains it while another message still references it", async () => {
   const store = await open();
   const previous = media("bot-A", "shared-old.png");
   const replacement = media("bot-A", "new.png");
@@ -211,7 +231,7 @@ test("replacing a shared media file retains it while another message still refer
   assert.equal(store.find("bot-A", "user-A", "2").mediaPath, previous);
 });
 
-test("media-only quotes can omit body text", async () => {
+sqliteTest("media-only quotes can omit body text", async () => {
   const store = await open();
   const file = media("bot-A", "media-only.png");
   await store.put(message({ body: undefined, sourceMediaPath: file }));
@@ -220,7 +240,7 @@ test("media-only quotes can omit body text", async () => {
   assert.equal(found.mediaPath, file);
 });
 
-test("deleting one account retains another account's quotes and media", async () => {
+sqliteTest("deleting one account retains another account's quotes and media", async () => {
   const store = await open();
   const fileA = media("bot-A", "image.png");
   const fileB = media("bot-B", "image.png");
@@ -241,7 +261,7 @@ test("account media paths remain distinct for colliding readable names", () => {
   assert.match(path.posix.basename(first), /^[a-z0-9._-]+-[a-f0-9]{16}$/);
 });
 
-test("GC removes unreferenced managed media without touching external files", async () => {
+sqliteTest("GC removes unreferenced managed media without touching external files", async () => {
   const store = await open();
   const orphan = media("bot-A", "orphan.png");
   const outside = path.join(temporary, "outside.png");

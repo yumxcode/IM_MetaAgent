@@ -14,7 +14,7 @@ LOG_DIR="$PROJECT_DIR/logs"
 # 1. 检查 node
 NODE_BIN="$(bash -lc 'command -v node' 2>/dev/null || true)"
 if [ -z "$NODE_BIN" ]; then
-  echo "❌ 找不到 node，请先通过 nvm 安装 Node.js >= 22" >&2
+  echo "❌ 找不到 node，请先通过 nvm 安装 Node.js >= 20.18" >&2
   exit 1
 fi
 echo "✅ node: $NODE_BIN"

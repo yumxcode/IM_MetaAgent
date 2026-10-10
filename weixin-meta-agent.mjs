@@ -55,8 +55,7 @@ import { WeixinBot, log } from "./src/index.mjs";
 import { resolveStateDir, readJson, writeJson, ensureDir } from "./src/util.mjs";
 import { checkMetaAgent, runMetaAgent } from "./src/meta-agent-bridge.mjs";
 import { installProcessGuards, installGracefulShutdown } from "./src/process-guard.mjs";
-import { createTaskBackend } from "./src/meta-agent-tasks.mjs";
-import { createTaskChat, TASK_COMMANDS } from "./src/task-chat.mjs";
+import { createTasksAgenticConsole, TASKS_HELP } from "./src/tasks-agentic.mjs";
 import { createReplyProgress } from "./src/reply-progress.mjs";
 import { parseAgentTrigger } from "./src/message-trigger.mjs";
 
@@ -190,8 +189,7 @@ function resolveSessionDir(accountId) {
 // 触发判断
 // ---------------------------------------------------------------------------
 
-const taskBackend = createTaskBackend();
-const taskChat = createTaskChat({ backend: taskBackend, maxRunning: CFG.taskMaxRunning });
+const tasksConsole = createTasksAgenticConsole({ maxRunning: CFG.taskMaxRunning });
 
 function parseTrigger(msg) {
   return parseAgentTrigger(msg, CFG);
@@ -420,8 +418,14 @@ async function handleMessage(bot, msg) {
 
   // Task management bypasses ordinary prompt locks so it stays available mid-run.
   if (trig.action === "tasks") {
-    const text = await taskChat.handle(msg, trig.request);
-    await sendReply(bot, msg, { ok: true, text });
+    const typing = await bot.typing({ to: from, contextToken: msg.contextToken }).catch(() => null);
+    await typing?.start().catch(() => {});
+    try {
+      const text = await tasksConsole.turn(trig.prompt);
+      await sendReply(bot, msg, { ok: true, text });
+    } finally {
+      await typing?.stop().catch(() => {});
+    }
     return;
   }
 
@@ -555,7 +559,7 @@ async function cmdCheck() {
 }
 
 async function cmdTasksCheck() {
-  const text = await taskChat.handle({ accountId: "local", fromUserId: "local" }, { command: "list", args: "" });
+  const text = await tasksConsole.check();
   console.log(text);
   if (text.startsWith("❌")) process.exitCode = 1;
 }
@@ -618,11 +622,11 @@ async function cmdRun() {
   console.log(`   私聊       : 全响应（无项目时自动创建临时项目）`);
   console.log(`   群聊       : ${CFG.groupTrigger === "off" ? "不响应" : CFG.groupTrigger === "all" ? "全响应" : `需前缀 "${CFG.triggerPrefix}"`}`);
   console.log(`   项目指令   : /p（私聊群聊均识别）`);
-  console.log(`   任务指令   : /tasks（查询全局 GLM 任务；/tasks manage start 启动自动调度）`);
+  console.log(`   任务指令   : /tasks <自然语言>（tasks --agentic 运维对话，会话 24 小时有效）`);
   console.log(`   最大并发   : ${CFG.maxConcurrent}（超过回复"系统繁忙"）`);
   console.log(`   白名单     : ${CFG.allowFrom.length ? CFG.allowFrom.join(", ") : "(不限)"}`);
   console.log("   Ctrl+C 退出\n");
-  installGracefulShutdown(bot, { close: () => taskBackend.close() });
+  installGracefulShutdown(bot, { close: () => tasksConsole.close() });
   await bot.start();
 }
 
@@ -634,7 +638,7 @@ function printHelp() {
   node weixin-meta-agent.mjs --login        扫码登录
   node weixin-meta-agent.mjs --check        自检 meta-agent CLI + 打印配置
   node weixin-meta-agent.mjs --accounts     列出已登录账号
-  node weixin-meta-agent.mjs --tasks-check  只读检查 GLM 任务查询（无需微信）
+  node weixin-meta-agent.mjs --tasks-check  只读检查任务运维后端（无需微信、不调用模型）
   node weixin-meta-agent.mjs --help         显示本帮助
 
 微信指令:
@@ -649,10 +653,11 @@ function printHelp() {
   无项目时发文本       自动创建临时项目
   /goal <目标>        用 auto 完整自主模式执行复杂目标（默认对话为 simple_auto）
 
-${TASK_COMMANDS}
+${TASKS_HELP}
 
 任务配置: META_AGENT_TASKS_BIN（默认 meta-agent-glm）、META_AGENT_TASKS_PROFILE、
-META_AGENT_TASKS_RUNTIME_DIR、META_AGENT_TASKS_MAX_RUNNING（默认 3）。
+META_AGENT_TASKS_WORKSPACES、META_AGENT_TASKS_MAX_TURNS、META_AGENT_TASKS_MAX_BUDGET_USD、
+META_AGENT_TASKS_TURN_TIMEOUT_MS、META_AGENT_TASKS_RUNTIME_DIR、META_AGENT_TASKS_MAX_RUNNING（默认 3）。
 其他环境变量见脚本头部注释。
 `);
 }

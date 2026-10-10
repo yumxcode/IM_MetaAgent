@@ -3,11 +3,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isQuoteCacheAvailable } from "../src/quote-store.mjs";
 import { WeixinBot } from "../src/index.mjs";
 import { saveAccount, loadAccount, deleteAccount } from "../src/auth.mjs";
 import { WeixinApiError } from "../src/http.mjs";
 import { encryptAesEcb } from "../src/crypto.mjs";
 import { pauseSession, _resetSessionGuardForTest } from "../src/session-guard.mjs";
+
+const sqliteTest = (name, fn) => test(name, { skip: !isQuoteCacheAvailable() && "requires native SQLite" }, fn);
 
 let stateDir;
 let oldStateDir;
@@ -67,7 +70,7 @@ test("stored redirected account URL is used and explicit bot URL takes precedenc
   assert.equal(new URL(calls[1].url).origin, "https://ilinkai.weixin.qq.com");
 });
 
-test("sent uint64 IDs populate quote cache and ID-only replies restore text context", async (t) => {
+sqliteTest("sent uint64 IDs populate quote cache and ID-only replies restore text context", async (t) => {
   const calls = fakeSend(t);
   const instance = bot();
   const sent = await instance.sendText({ to: USER, text: "/tasks delete 1", contextToken: "ctx", runId: "task-run" });
@@ -97,6 +100,35 @@ test("reply inherits account, current conversation token and run ID", async (t) 
   assert.equal(calls[1].msg.item_list[0].type, 11);
 });
 
+test("optional cache absence does not block text, server-provided quotes or command parsing", async t => {
+  const calls = fakeSend(t);
+  const instance = bot(isQuoteCacheAvailable() ? { quoteCache: { enabled: false } } : {});
+  const sent = await instance.sendText({ to: USER, text: "运行状态", contextToken: "ctx", runId: "send-run" });
+  assert.equal(sent.serverMessageId, "18446744073709551615");
+  assert.equal(instance._quoteStore, null);
+  const received = [];
+  instance.on("message", msg => received.push(msg));
+  await instance._handleInbound({ message_id: "9007199254740993", from_user_id: USER, message_type: 1, context_token: "received-ctx", run_id: "incoming-run", item_list: [{ type: 1, text_item: { text: "/tasks running" }, ref_msg: { svr_id: sent.serverMessageId, message_item: { type: 1, text_item: { text: "服务端提供的引用" } } } }] }, ACCOUNT);
+  assert.equal(received[0].commandText, "/tasks running");
+  assert.equal(received[0].quotes[0].body, "服务端提供的引用");
+  assert.equal(received[0].messageId, "9007199254740993");
+  await instance.reply(received[0], "状态已读取");
+  assert.equal(calls[1].msg.context_token, "received-ctx");
+  assert.equal(calls[1].msg.run_id, "incoming-run");
+});
+
+test("optional cache absence does not block encrypted full URL file downloads", async t => {
+  const key = Buffer.from("00112233445566778899aabbccddeeff", "hex"), content = Buffer.from("Node 20 media");
+  t.mock.method(globalThis, "fetch", async () => new Response(encryptAesEcb(content, key)));
+  const options = { autoDownloadMedia: true, ...(isQuoteCacheAvailable() ? { quoteCache: { enabled: false } } : {}) };
+  const instance = bot(options), received = [];
+  instance.on("message", msg => received.push(msg));
+  await instance._handleInbound({ message_id: "9007199254740992", from_user_id: USER, message_type: 1, item_list: [{ type: 4, file_item: { file_name: "node20.txt", media: { full_url: "https://novac2c.cdn.weixin.qq.com/mock-node20", aes_key: Buffer.from(key.toString("hex")).toString("base64") } } }] }, ACCOUNT);
+  assert.equal(fs.readFileSync(received[0].mediaPath, "utf8"), content.toString());
+  assert.equal(received[0].fileName, "node20.txt");
+  assert.equal(instance._quoteStore, null);
+});
+
 test("bot echoes are exposed as raw events without triggering replies", async () => {
   const instance = bot({ quoteCache: { enabled: false } });
   let rawCount = 0;
@@ -108,7 +140,7 @@ test("bot echoes are exposed as raw events without triggering replies", async ()
   assert.equal(messageCount, 0);
 });
 
-test("encrypted full_url media is downloaded, cached and restored by an ID-only reply", async (t) => {
+sqliteTest("encrypted full_url media is downloaded, cached and restored by an ID-only reply", async (t) => {
   const mediaUrl = "https://novac2c.cdn.weixin.qq.com/object?signature=test";
   const key = Buffer.from("00112233445566778899aabbccddeeff", "hex");
   const plaintext = Buffer.from("incoming file content");
@@ -242,7 +274,7 @@ test("credentials removed during polling do not block stop and retain notificati
   assert.equal(instance._polling.size, 0);
 });
 
-test("only final streaming text is cached under the final server-assigned ID", async (t) => {
+sqliteTest("only final streaming text is cached under the final server-assigned ID", async (t) => {
   const calls = [];
   const ids = ["9007199254740992", "9007199254740993", "18446744073709551615"];
   t.mock.method(globalThis, "fetch", async (url, options) => {
@@ -262,7 +294,7 @@ test("only final streaming text is cached under the final server-assigned ID", a
   assert.deepEqual(calls.map(call => call.message_state), [1, 1, 2]);
 });
 
-test("remote outbound files are copied into quote cache before temporary downloads are removed", async (t) => {
+sqliteTest("remote outbound files are copied into quote cache before temporary downloads are removed", async (t) => {
   const origin = "https://example.test/report.txt";
   const content = "远程报告内容";
   const requests = [];
@@ -285,7 +317,7 @@ test("remote outbound files are copied into quote cache before temporary downloa
   assert.equal(cached.mediaMime, "text/plain");
 });
 
-test("logout removes persisted quote history even when no store was already open", async (t) => {
+sqliteTest("logout removes persisted quote history even when no store was already open", async (t) => {
   fakeSend(t);
   const original = bot();
   await original.sendText({ to: USER, text: "private cached reply", contextToken: "ctx" });

@@ -1,7 +1,7 @@
 /** Adapted from Tencent openclaw-weixin 2.4.9 (MIT). See ./tencent-LICENSE. */
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { createRequire } from "node:module";
+import { createRequire, isBuiltin } from "node:module";
 import path from "node:path";
 import { resolveStateDir, log as logger } from "./util.mjs";
 const DEFAULT_RETENTION_DAYS = 30;
@@ -12,6 +12,7 @@ const DEFAULT_MAX_SINGLE_MEDIA_BYTES = 25 * 1024 * 1024;
 const GC_WRITE_INTERVAL = 100;
 const GC_TIMER_MS = 60 * 60 * 1000;
 const QUOTE_MEDIA_SUBDIR = "inbound/im-metaagent-quotes";
+export function isQuoteCacheAvailable() { return isBuiltin("node:sqlite"); }
 function positiveNumber(value, fallback) {
     return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
@@ -80,6 +81,10 @@ export class QuoteStore {
     static async open(params) {
         if (!params.policy.enabled)
             return null;
+        if (!isQuoteCacheAvailable()) {
+            logger.info("历史引用缓存已关闭：当前 Node 没有内置 SQLite。微信收发和任务管理继续运行；启用此缓存需 Node.js >= 22.13。");
+            return null;
+        }
         try {
             const sqlite = (await import("node:sqlite"));
             const rootDir = params.rootDir ?? path.join(resolveStateDir(), "weixin-bot");

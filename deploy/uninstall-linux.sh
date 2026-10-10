@@ -10,7 +10,7 @@ SERVICE_DST="/etc/systemd/system/${SERVICE_NAME}.service"
 if [ -f "$SERVICE_DST" ]; then
   sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
   sudo systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-  sudo rm -f "$SERVICE_DST"
+  sudo rm -f "$SERVICE_DST" /etc/logrotate.d/im-metaagent
   sudo systemctl daemon-reload
   echo "✅ 已卸载 systemd 服务: $SERVICE_NAME"
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

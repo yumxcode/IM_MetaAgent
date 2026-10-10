@@ -12,7 +12,7 @@
 
 本项目在私聊中支持文本、图片、语音、文件及视频。语音接收优先使用服务端转文字，下载后可用可选的 `silk-wasm` 解码；语音发送要求 SILK V3 编码，普通 MP3/WAV 以文件附件发送。流式消息、Typing 指示、运行通知和工具进度的显示效果由微信客户端与服务端决定。
 
-微信聊天中的 `/tasks` 属于本地应用功能，访问本机的 meta-agent runtime，不是腾讯新增的 task API。命令详见 [README](./README.md#在微信查看和管理-glm-任务)。
+微信聊天中的 `/tasks` 属于本地应用功能，访问本机的 meta-agent runtime，不是腾讯新增的 task API。用法详见 [README](./README.md#在微信查看和管理-glm-任务tasks--agentic)。
 
 ## 请求信息与鉴权
 
@@ -34,7 +34,7 @@
 {
   "base_info": {
     "channel_version": "2.4.9",
-    "bot_agent": "IMMetaAgent/1.0.0"
+    "bot_agent": "IMMetaAgent/1.1.1"
   }
 }
 ```
@@ -108,7 +108,7 @@
 
 消息 ID 与引用 `svr_id` 是线上 uint64，本项目无损保留为字符串，避免先转换成 JavaScript Number 后丢失精度。新版微信只发送引用消息 ID 时，从按账号、发送者和会话隔离的近期缓存还原可用文本和附件；未命中时明确保留缺少引用原文的状态。缓存不能凭空读取本机没有接收过的微信历史消息。
 
-工具开始/结束事件通过工具进度 item 发送，发送失败不影响本地 Agent 执行和最终回复。Typing 与生成中状态并不代替持久化任务检查点；微信 `/tasks progress` 展示的是本地 runtime 已保存的实际数据。
+工具开始/结束事件通过工具进度 item 发送，发送失败不影响本地 Agent 执行和最终回复。Typing 与生成中状态并不代替持久化任务检查点；微信 `/tasks` 运维对话读取的是本地 runtime 已保存的实际数据。
 
 ## 安装与更新参考包
 

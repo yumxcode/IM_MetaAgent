@@ -16,11 +16,13 @@
  *   pm2 status / pm2 logs im-metaagent / pm2 restart im-metaagent
  *   pm2 delete im-metaagent
  */
+const path = require('node:path');
 module.exports = {
   apps: [{
     name: 'im-metaagent',
-    script: 'weixin-meta-agent.mjs',
-    cwd: __dirname + '/..',
+    script: 'deploy/start.sh',
+    interpreter: '/bin/bash',
+    cwd: path.resolve(__dirname, '../..'),
 
     instances: 1,
     exec_mode: 'fork',

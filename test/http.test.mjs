@@ -38,8 +38,8 @@ test("official application headers, random UIN and encoded 2.4.9 client version"
 });
 
 test("bot agent accepts safe UA products and comments with a 256-byte cap", () => {
-  assert.equal(sanitizeBotAgent(undefined), "IMMetaAgent/1.0.0");
-  assert.equal(sanitizeBotAgent("垃圾\n header:value"), "IMMetaAgent/1.0.0");
+  assert.equal(sanitizeBotAgent(undefined), "IMMetaAgent/1.1.1");
+  assert.equal(sanitizeBotAgent("垃圾\n header:value"), "IMMetaAgent/1.1.1");
   assert.equal(sanitizeBotAgent("Agent/1.0 (local bridge) Other/2.0+beta"), "Agent/1.0 (local bridge) Other/2.0+beta");
   assert.equal(sanitizeBotAgent("Valid/1.0 invalid 注入 Good/2.0"), "Valid/1.0 Good/2.0");
   assert.ok(Buffer.byteLength(sanitizeBotAgent(Array.from({ length: 100 }, () => "Agent/1.0").join(" "))) <= 256);

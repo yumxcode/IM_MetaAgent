@@ -22,7 +22,7 @@ export const ILINK_APP_ID = "bot";
 export const ILINK_APP_CLIENT_VERSION = (2 << 16) | (4 << 8) | 9;
 
 /** 本应用的上游身份；可用 WEIXIN_BOT_AGENT 覆盖。 */
-export const DEFAULT_BOT_AGENT = "IMMetaAgent/1.0.0";
+export const DEFAULT_BOT_AGENT = "IMMetaAgent/1.1.1";
 
 /** 长轮询默认超时（服务器最多 hold 35s） */
 export const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
