@@ -175,7 +175,8 @@ test('systemd template quotes paths and puts startup rate limits in the Unit sec
   assert.ok(rendered.includes('StandardError=append:/srv/IM $x%% y/current/logs/im-metaagent.err.log'));
   assert.throws(() => renderService(template, { project: '/srv/path\nUser=root', user: 'agent', home: '/home/agent', nodeDir: '/opt/node' }));
   const rotate = renderLogrotate('/srv/IM agent/shared/logs', 'agent', 'agent');
-  assert.ok(rotate.includes('"/srv/IM agent/shared/logs/*.log"'));
+  assert.ok(rotate.includes('"/srv/IM agent/shared/logs/im-metaagent.out.log" "/srv/IM agent/shared/logs/im-metaagent.err.log" {'));
+  assert.ok(!rotate.includes('*.log'), 'the self-rotating app log is not also rotated by logrotate');
   assert.ok(rotate.includes('su agent agent'));
 });
 

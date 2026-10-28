@@ -2,7 +2,7 @@
 
 > 1.2.0 升级要求：先构建含 `@meta-agent/runtime/im` 契约 v1 的 runtime。设置 `META_AGENT_RUNTIME_DIR=/absolute/path/to/meta_agent_runtime`，或升级独立安装并确保 CLI 与公开接口来自同一构建。微信先单独发送 `/tasks`、`/human`、`/talk` 或 `/auto` 进入模式，随后直接发内容，单独发送对应 `xxx/` 退出。旧入口不再触发，旧资料保留。详见 [P0 说明](docs/p0-personal-agent.md)。
 
-# IM_MetaAgent 1.1.4 远端安装与更新
+# IM_MetaAgent 1.3.0 远端安装与更新
 
 本发布包只包含 IM_MetaAgent：独立微信接入层、桥接入口、测试、部署脚本及腾讯官方参考代码（插件 2.4.9 / 安装器 2.1.4）。不包含 meta-agent runtime、依赖目录、本机配置、微信凭据、任务数据或日志；安装脚本不会安装或更新 runtime。
 
@@ -22,12 +22,12 @@ Node.js 20.18 及以上可安装并运行独立 IM 接入层。微信收发、�
 
 ## 首次安装
 
-将 `im-metaagent-1.1.4.tar.gz` 和 `im-metaagent-1.1.4.sha256` 上传到服务器同一目录，以运行任务的普通用户执行：
+将 `im-metaagent-1.3.0.tar.gz` 和 `im-metaagent-1.3.0.sha256` 上传到服务器同一目录，以运行任务的普通用户执行：
 
 ```bash
-sha256sum -c im-metaagent-1.1.4.sha256
-tar -xzf im-metaagent-1.1.4.tar.gz
-cd im-metaagent-1.1.4
+sha256sum -c im-metaagent-1.3.0.sha256
+tar -xzf im-metaagent-1.3.0.tar.gz
+cd im-metaagent-1.3.0
 node scripts/install-release.mjs "$HOME/apps/IM_MetaAgent" --no-service
 ```
 
@@ -58,14 +58,14 @@ bash deploy/install-linux.sh
 sudo systemctl status im-metaagent
 ```
 
-`agent:tasks-check` 只读，不会启动任务、不调用模型。先确认能读取与 tmux 中相同的任务，再从微信先发送 `/tasks`，再发送“查看任务”验证运维对话，最后发送 `tasks/` 退出。Linux 安装脚本启用开机自启、崩溃重启，并在系统已有 logrotate 时安装日志轮转规则。
+`agent:tasks-check` 只读，不会启动任务、不调用模型。先确认能读取与 tmux 中相同的任务，再从微信先发送 `/tasks`，再发送“查看任务”验证运维对话，最后发送 `tasks/` 退出。Linux 安装脚本启用开机自启、崩溃重启，并在系统已有 logrotate 时为 systemd 的 stdout/stderr 文件安装轮转规则；应用日志 `im-metaagent.log` 由程序自身轮转。
 
 ## npm 全局安装和启动
 
 本地发布包也可以全局安装；使用包内入口文件启动：
 
 ```bash
-npm install -g ./im-metaagent-1.1.4.tar.gz
+npm install -g ./im-metaagent-1.3.0.tar.gz
 IM_APP="$(npm root -g)/im-metaagent"
 mkdir -p "$HOME/im-metaagent"
 cd "$HOME/im-metaagent"
@@ -84,10 +84,10 @@ node "$IM_APP/weixin-meta-agent.mjs"
 上传新发布包及校验文件，校验、解压后从新解压目录运行同一个安装器，目标目录始终保持一致：
 
 ```bash
-# 以 1.1.4 为例；后续替换成新版本的文件名和目录名
-sha256sum -c im-metaagent-1.1.4.sha256
-tar -xzf im-metaagent-1.1.4.tar.gz
-cd im-metaagent-1.1.4
+# 以 1.3.0 为例；后续替换成新版本的文件名和目录名
+sha256sum -c im-metaagent-1.3.0.sha256
+tar -xzf im-metaagent-1.3.0.tar.gz
+cd im-metaagent-1.3.0
 node scripts/install-release.mjs "$HOME/apps/IM_MetaAgent" --service
 ```
 
@@ -124,7 +124,8 @@ node scripts/install-release.mjs "$HOME/apps/IM_MetaAgent" --rollback --service
 # 接收服务状态
 sudo systemctl status im-metaagent
 # 消息/错误日志（journalctl 主要显示服务启停信息）
-tail -f "$HOME/apps/IM_MetaAgent/shared/logs/im-metaagent.err.log"
+tail -f "$HOME/apps/IM_MetaAgent/shared/logs/im-metaagent.log"      # 应用日志（自身按 10MB 轮转）
+tail -f "$HOME/apps/IM_MetaAgent/shared/logs/im-metaagent.err.log"  # 启动信息与崩溃堆栈
 # 停止接收服务
 sudo systemctl stop im-metaagent
 ```

@@ -31,7 +31,8 @@ export function renderService(template, { project, user, home, nodeDir, searchPa
 }
 export function renderLogrotate(logDir, user, group) {
   if (/[\r\n"\\]/.test(logDir) || !/^[\w.-]+\$?$/.test(user) || !/^[\w.-]+$/.test(group)) throw new Error('Unsupported logrotate setting');
-  return `"${logDir}/*.log" {\n    daily\n    maxsize 10M\n    rotate 7\n    compress\n    delaycompress\n    missingok\n    notifempty\n    copytruncate\n    su ${user} ${group}\n}\n`;
+  // The app log (im-metaagent.log) rotates itself; logrotate only handles the service manager's stdout/stderr files.
+  return `"${logDir}/im-metaagent.out.log" "${logDir}/im-metaagent.err.log" {\n    daily\n    maxsize 10M\n    rotate 7\n    compress\n    delaycompress\n    missingok\n    notifempty\n    copytruncate\n    su ${user} ${group}\n}\n`;
 }
 async function install(project) {
   if (process.platform !== 'linux') throw new Error('systemd installation requires Linux');
