@@ -16,13 +16,26 @@ import { AlertNotifier, ConnectionMonitor } from './src/alerts.mjs';
 import { readState } from './src/durable-store.mjs';
 
 function positive(value, fallback) { const n = Number(value); return Number.isFinite(n) && n > 0 ? n : fallback; }
+/** Positive number, or undefined when unset/invalid (the runtime default then applies). */
+function optionalPositive(value, integer = false) {
+  if (value === undefined || String(value).trim() === '') return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? (integer ? Math.floor(n) : n) : undefined;
+}
+/** Settings from 1.2 that capped every Auto run (30 turns / $10); now ignored. */
+export function deprecatedLimitKeys(env = process.env) {
+  return ['META_AGENT_MAX_TURNS', 'META_AGENT_MAX_BUDGET_USD'].filter(key => env[key] !== undefined && env[key] !== '');
+}
 /** Non-negative number where an explicit 0 disables the feature. */
 function nonNegative(value, fallback) { if (value === undefined || value === '') return fallback; const n = Number(value); return Number.isFinite(n) && n >= 0 ? n : fallback; }
 export function loadConfig(env = process.env) {
   return { allowFrom: (env.WEIXIN_ALLOW_FROM || '').split(',').map(s => s.trim()).filter(Boolean),
     groupTrigger: env.WEIXIN_GROUP_TRIGGER || 'off', maxConcurrent: Math.floor(positive(env.META_AGENT_MAX_CONCURRENT, 2)),
-    maxTurns: Math.floor(positive(env.META_AGENT_MAX_TURNS, 30)), maxBudgetUsd: positive(env.META_AGENT_MAX_BUDGET_USD, 10),
+    // Unset limits = meta-agent defaults. These are forwarded as --max-turns / --max-budget-usd only when set.
+    autoMaxTurns: optionalPositive(env.META_AGENT_AUTO_MAX_TURNS, true), autoMaxBudgetUsd: optionalPositive(env.META_AGENT_AUTO_MAX_BUDGET_USD),
+    talkMaxTurns: optionalPositive(env.META_AGENT_TALK_MAX_TURNS, true), talkMaxBudgetUsd: optionalPositive(env.META_AGENT_TALK_MAX_BUDGET_USD),
     timeoutMs: Math.max(0, Number(env.META_AGENT_TIMEOUT_MS) || 0),
+    talkTimeoutMs: nonNegative(env.META_AGENT_TALK_TIMEOUT_MS, 15 * 60 * 1000),
     retentionDays: nonNegative(env.IM_RETENTION_DAYS, 30),
     decisionPollMs: nonNegative(env.META_AGENT_DECISION_POLL_MS, 120000),
     sendFiles: env.IM_SEND_FILES !== 'false', sendFilesMax: Math.floor(positive(env.IM_SEND_FILES_MAX, 5)),
@@ -113,6 +126,8 @@ async function runService({ cfg, stateDir, adapter, alerts }) {
   app = new PersonalAgent({ root: path.join(stateDir, 'personal-agent'), bot, cfg, adapter, log, alerts });
   new ConnectionMonitor({ alerts, offlineAfterMs: positive(process.env.IM_ALERT_OFFLINE_MINUTES, 10) * 60 * 1000 }).attach(bot);
   log.info(`告警通道：${alerts.describe()}`);
+  const deprecated = deprecatedLimitKeys();
+  if (deprecated.length) log.warn(`${deprecated.join('、')} 已停用并被忽略：auto 与 talk 默认使用 meta-agent 自身的轮数/预算；如需限制，改用 META_AGENT_AUTO_MAX_TURNS / META_AGENT_AUTO_MAX_BUDGET_USD / META_AGENT_TALK_MAX_TURNS / META_AGENT_TALK_MAX_BUDGET_USD。`);
   if (!cfg.allowFrom.length) log.info(app.store.state.owner ? `仅主人可用：${app.store.state.owner.userId}` : '未设置 WEIXIN_ALLOW_FROM：首位私聊者将被绑定为主人');
   let human;
   try {

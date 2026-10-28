@@ -2,8 +2,9 @@
  * Durable reminders and scheduled chat prompts (pure helpers + talk tools).
  *
  * Times are the bot machine's local time (set TZ for the service if needed).
- * The talk worker only *proposes* operations; the bot process applies them to
- * its single-writer state when the turn's result arrives.
+ * The chat agent only *proposes* operations (see remind-cli.mjs); the bot
+ * process applies them to its single-writer state when the turn finishes.
+ * This module has no imports so it can be copied next to remind-cli.mjs.
  */
 const FIELD_RANGES = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 7]];
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
@@ -139,56 +140,4 @@ export function planSchedule({ text, at, cron, kind = 'remind' }, now = Date.now
 /** Next fire time after a run at `firedAt`, or null for one-shot schedules. */
 export function advanceSchedule(schedule, firedAt) {
   return schedule.cron ? nextCronTime(schedule.cron, firedAt) : null;
-}
-
-/**
- * Talk-session tools. `existing` is the owner's active schedules snapshot;
- * accepted operations are pushed to `ops` and applied by the bot process.
- */
-export function createScheduleTools({ existing = [], ops = [], now = Date.now } = {}) {
-  const permission = { category: 'state', requiresWorkspace: false, sensitive: false, planMode: 'allow' };
-  const pendingCreates = () => ops.filter(op => op.type === 'create').length;
-  return [{
-    name: 'reminder_create',
-    abortSupport: 'bounded',
-    permission,
-    description: '为用户创建提醒或定时任务，由微信机器人在到点时发送。一次性用 at（本机时间 "YYYY-MM-DD HH:mm"），重复用 cron（5 字段：分 时 日 月 周，如 "0 8 * * 1-5" 为工作日 08:00）。'
-      + 'kind=remind 到点原样发送 text；kind=talk 到点把 text 当作一条聊天指令执行（可联网搜索），把结果发给用户，适合“每天早上给我简报”。'
-      + '只有用户明确要求提醒/定时时才调用；时间不明确先问用户。调用成功只代表已提交，机器人会在本条回复后发确认。',
-    inputSchema: { type: 'object', additionalProperties: false, required: ['text'], properties: {
-      text: { type: 'string', description: '到点发送的提醒内容，或 kind=talk 时要执行的指令' },
-      at: { type: 'string', description: '一次性时间，本机时区 "YYYY-MM-DD HH:mm"' },
-      cron: { type: 'string', description: '重复规则，5 字段 cron' },
-      kind: { type: 'string', enum: ['remind', 'talk'], description: '默认 remind' },
-    } },
-    async call(input) {
-      try {
-        if (existing.length + pendingCreates() >= MAX_ACTIVE_SCHEDULES) throw new Error(`最多 ${MAX_ACTIVE_SCHEDULES} 个有效提醒，请先取消一些`);
-        const plan = planSchedule(input, now());
-        ops.push({ type: 'create', ...plan });
-        return { content: `已提交：${describeSchedule(plan, now())}。编号会在机器人确认消息中给出。`, isError: false };
-      } catch (error) { return { content: `未创建：${error.message}`, isError: true }; }
-    },
-  }, {
-    name: 'reminder_list',
-    abortSupport: 'bounded',
-    permission: { ...permission, category: 'read' },
-    description: '列出用户当前有效的提醒和定时任务（编号 R1、R2…）。',
-    inputSchema: { type: 'object', additionalProperties: false, properties: {} },
-    async call() {
-      return { content: existing.length ? existing.map(s => describeSchedule(s, now())).join('\n') : '当前没有有效的提醒或定时任务。', isError: false };
-    },
-  }, {
-    name: 'reminder_cancel',
-    abortSupport: 'bounded',
-    permission,
-    description: '按编号取消用户的提醒或定时任务（如 R3）。只在用户明确要求取消时调用。',
-    inputSchema: { type: 'object', additionalProperties: false, required: ['id'], properties: { id: { type: 'string', description: '提醒编号，如 R3' } } },
-    async call(input) {
-      const id = String(input.id || '').trim().toUpperCase();
-      if (!existing.some(s => s.id === id)) return { content: `没有有效的提醒 ${id}`, isError: true };
-      ops.push({ type: 'cancel', id });
-      return { content: `已提交取消 ${id}。`, isError: false };
-    },
-  }];
 }

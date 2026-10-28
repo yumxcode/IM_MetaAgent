@@ -10,7 +10,7 @@
 - execution-worker：独立传输 supervisor，排他认领一次请求；执行内核、工具权限、Auto 后续调度仍由 runtime 负责。
 - durable-store：单写者，原子写入和文件/目录 fsync，读取损坏文件失败退出，避免静默清空。
 
-每次进入 Auto 后的首个目标不带 resume；同模式后续普通消息按顺序 steer 当前任务，等待上一轮结束。Auto 退出重进时可按任务编号选择原任务上下文，也可新建；显式 continue/steer 绑定原任务、模式和配置，恢复前查询 runtime 状态，拒绝同时启动正在运行或执行权待核验的任务。聊天使用无工作工具的 AgenticSession，历史不与 Auto 共用。
+每次进入 Auto 后的首个目标不带 resume；同模式后续普通消息按顺序 steer 当前任务，等待上一轮结束。Auto 退出重进时可按任务编号选择原任务上下文，也可新建；显式 continue/steer 绑定原任务、模式和配置，恢复前查询 runtime 状态，拒绝同时启动正在运行或执行权待核验的任务。聊天（1.4 起）通过 CLI 的 simple_auto 会话运行，历史不与 Auto 共用。
 
 ## 崩溃窗口
 

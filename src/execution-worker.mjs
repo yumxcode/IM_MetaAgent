@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { atomicWrite, readState } from './durable-store.mjs';
-import { declaredPathsFromEvent, collectDeliverables } from './deliverables.mjs';
+import { declaredPathsFromEvent, collectDeliverables, outboxFiles } from './deliverables.mjs';
 
 export async function runWorker(directory, { adapterFactory } = {}) {
   const job = readState(path.join(directory, 'request.json'), null);
@@ -67,9 +67,11 @@ export async function runWorker(directory, { adapterFactory } = {}) {
     }
   } catch (error) { result = { ok: false, text: '', subtype: controller.signal.aborted ? 'cancelled' : 'worker_error', errors: [error.message] }; }
   finally { clearInterval(timer); process.removeListener('SIGTERM', abort); process.removeListener('SIGINT', abort); }
-  if (job.kind === 'auto' && job.workspace) {
+  if (['auto', 'talk'].includes(job.kind) && job.workspace) {
     // Files are reported, not sent, here: the bot applies size/count limits and owns delivery.
-    try { const found = collectDeliverables({ workspace: job.workspace, declared, since: startedAt - 1000 }); if (found.files.length) result = { ...result, deliverables: found }; }
+    try {
+      if (job.kind === 'talk') declared.push(...outboxFiles(job.workspace, startedAt - 1000));
+      const found = collectDeliverables({ workspace: job.workspace, declared, since: startedAt - 1000 }); if (found.files.length) result = { ...result, deliverables: found }; }
     catch (error) { result = { ...result, deliverableError: error.message }; }
   }
   atomicWrite(path.join(directory, 'result.json'), { ...result, requestId: job.id, completedAt: Date.now() });

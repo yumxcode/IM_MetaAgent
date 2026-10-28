@@ -148,7 +148,8 @@ test('recurring scheduled prompts run as chat turns; missed recurring slots are 
   });
   await f.app.tick();
   const job = f.request(0);
-  assert.equal(job.kind, 'talk'); assert.equal(job.scheduleId, 'R1'); assert.match(job.historyFile, /talk/);
+  assert.equal(job.kind, 'talk'); assert.equal(job.scheduleId, 'R1'); assert.equal(job.conversationKey, 'schedule:R1');
+  assert.equal(job.maxTurns, undefined); assert.equal(job.runtime.maxBudgetUsd, undefined);
   f.finish(0, { text: '今日要闻……' }); await f.app.tick(); await f.app.flushOutbox();
   assert.ok(f.sent.some(s => s.text.startsWith('⏰ 定时任务 R1\n今日要闻')));
   const next = f.app.store.state.schedules.R1.nextAt;

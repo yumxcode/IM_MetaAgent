@@ -16,16 +16,18 @@ export function checkMetaAgent({ bin = resolveMetaAgentBin(), env = process.env 
 }
 
 export function buildMetaAgentArgs(prompt, opts = {}) {
-  const { mode = 'auto', maxTurns = 30, workspace, sessionDir, resumeSessionId, intent = 'new', images = [] } = opts;
+  const { mode = 'auto', maxTurns, workspace, sessionDir, resumeSessionId, intent = 'new', images = [] } = opts;
   if (!['new', 'continue', 'steer', 'new_goal'].includes(intent)) throw new Error('Unknown execution intent');
   if (intent !== 'new' && !resumeSessionId) throw new Error('Continuation requires a session ID');
   if (intent === 'new' && resumeSessionId) throw new Error('A new task must not resume another task');
   if (intent !== 'continue' && !String(prompt || '').trim()) throw new Error('empty prompt');
-  const args = ['--json', '--yes', '--mode', mode, '--max-turns', String(maxTurns)];
+  // Limits are passed only when the operator configured them; otherwise meta-agent's own defaults apply.
+  const args = ['--json', '--yes', '--mode', mode];
+  if (Number.isFinite(maxTurns) && maxTurns > 0) args.push('--max-turns', String(Math.floor(maxTurns)));
   if (workspace) args.push('--workspace', workspace);
   if (sessionDir) args.push('--session-dir', sessionDir);
   if (opts.systemPrompt) args.push('--system', opts.systemPrompt);
-  if (opts.maxBudgetUsd) args.push('--max-budget-usd', String(opts.maxBudgetUsd));
+  if (Number.isFinite(opts.maxBudgetUsd) && opts.maxBudgetUsd > 0) args.push('--max-budget-usd', String(opts.maxBudgetUsd));
   for (const image of images) args.push('--image', image);
   if (resumeSessionId) args.push('--resume', resumeSessionId);
   if (intent === 'continue') args.push('--continue');

@@ -48,7 +48,7 @@ export function containedFile(workspace, candidate) {
 }
 
 /** Document/media files modified at or after `since` (ms), newest first. */
-export function scanRecentDocuments(workspace, since, { maxDepth = 4, maxEntries = 5000 } = {}) {
+export function scanRecentDocuments(workspace, since, { maxDepth = 4, maxEntries = 5000, extensions = DOCUMENT_EXTENSIONS } = {}) {
   const found = []; let seen = 0;
   const walk = (dir, depth) => {
     let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
@@ -57,7 +57,7 @@ export function scanRecentDocuments(workspace, since, { maxDepth = 4, maxEntries
       if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) { if (depth < maxDepth && !SKIP_DIRS.has(entry.name)) walk(full, depth + 1); continue; }
-      if (!entry.isFile() || !DOCUMENT_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
+      if (!entry.isFile() || (extensions && !extensions.has(path.extname(entry.name).toLowerCase()))) continue;
       try { const stat = fs.statSync(full); if (stat.mtimeMs >= since) found.push({ path: full, mtimeMs: stat.mtimeMs }); } catch { /* vanished */ }
     }
   };
@@ -76,6 +76,12 @@ export function collectDeliverables({ workspace, declared = [], since, limit = 2
   if (!Number.isFinite(since)) return { files: [], source: 'none' };
   const scanned = scanRecentDocuments(workspace, since).slice(0, limit);
   return { files: scanned, source: scanned.length ? 'scan' : 'none' };
+}
+
+/** Chat convention: anything saved under <workspace>/outbox during the turn is a deliverable. */
+export function outboxFiles(workspace, since) {
+  const dir = path.join(workspace, 'outbox');
+  return fs.existsSync(dir) ? scanRecentDocuments(dir, since, { maxDepth: 2, extensions: null }) : [];
 }
 
 export function mediaKind(file) {

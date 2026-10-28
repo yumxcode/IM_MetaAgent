@@ -6,7 +6,8 @@ import path from 'node:path';
 import { createHmac } from 'node:crypto';
 import { AlertNotifier, ConnectionMonitor, resolveAlertChannels, buildAlertPayload } from '../src/alerts.mjs';
 import { RotatingLogFile, RepeatSuppressor } from '../src/util.mjs';
-import { parseCron, nextCronTime, parseAt, planSchedule, describeCron, createScheduleTools, advanceSchedule } from '../src/schedules.mjs';
+import { parseCron, nextCronTime, parseAt, planSchedule, describeCron, advanceSchedule } from '../src/schedules.mjs';
+import { runRemindCli } from '../src/remind-cli.mjs';
 import { declaredPathsFromEvent, collectDeliverables, containedFile } from '../src/deliverables.mjs';
 import { startPolling } from '../src/poller.mjs';
 import { _resetSessionGuardForTest } from '../src/session-guard.mjs';
@@ -124,16 +125,17 @@ test('cron and one-shot parsing', () => {
   assert.equal(advanceSchedule({ at: 1 }, now), null);
 });
 
-test('chat schedule tools only propose operations and validate input', async () => {
-  const ops = [];
-  const [create, list, cancel] = createScheduleTools({ existing: [{ id: 'R1', kind: 'remind', text: '喝水', cron: '0 15 * * *', nextAt: Date.now() + 1000 }], ops });
-  assert.equal((await create.call({ text: '开会', at: '00:00' })).isError, false);
-  assert.equal((await create.call({ text: '错误', cron: 'bad' })).isError, true);
-  assert.match((await list.call({})).content, /R1 · 提醒 · 每天 15:00/);
-  assert.equal((await cancel.call({ id: 'r9' })).isError, true);
-  assert.equal((await cancel.call({ id: 'r1' })).isError, false);
-  assert.deepEqual(ops.map(op => op.type), ['create', 'cancel']);
-  assert.equal(ops[1].id, 'R1');
+test('the reminder helper validates, lists pending requests and only cancels known ids', t => {
+  const dir = temp(t), now = new Date(2026, 9, 28, 9, 40).getTime();
+  fs.writeFileSync(path.join(dir, 'reminders.json'), JSON.stringify([{ id: 'R1', kind: 'remind', text: '喝水', cron: '0 15 * * *', nextAt: now + 1000 }]));
+  assert.equal(runRemindCli(['create', '--text', '开会', '--at', '2026-10-29 10:00'], { dir, now }).code, 0);
+  assert.throws(() => runRemindCli(['create', '--text', '错误', '--cron', 'bad'], { dir, now }), /5 个字段/);
+  assert.match(runRemindCli(['list'], { dir, now }).out, /R1 · 提醒 · 每天 15:00[\s\S]*（本轮待确认）提醒 · 10-29 周四 10:00 · 开会/);
+  assert.equal(runRemindCli(['cancel', 'r9'], { dir, now }).code, 1);
+  assert.equal(runRemindCli(['cancel', 'r1'], { dir, now }).code, 0);
+  assert.equal(runRemindCli(['bogus'], { dir, now }).code, 2);
+  const ops = fs.readFileSync(path.join(dir, 'requests.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(ops.map(op => op.type), ['create', 'cancel']); assert.equal(ops[1].id, 'R1');
 });
 
 test('deliverables stay inside the workspace; undeclared runs fall back to recent documents', t => {
@@ -172,4 +174,24 @@ out({ type: 'result', isError: false, subtype: 'success', result: 'done', sessio
   const result = readState(path.join(dir, 'result.json'), null);
   assert.equal(result.text, 'done'); assert.equal(result.deliverables.source, 'declared');
   assert.deepEqual(result.deliverables.files.map(f => path.basename(f)), ['report.pdf']);
+});
+
+test('chat turns deliver files saved under outbox/ (any type) and ignore the reminder helper folder', async t => {
+  const root = temp(t), workspace = path.join(root, 'chat'); fs.mkdirSync(workspace);
+  const bin = path.join(root, 'fake-runtime');
+  fs.writeFileSync(bin, `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.mkdirSync('outbox', { recursive: true }); fs.writeFileSync('outbox/notes.txt', 'n');
+fs.writeFileSync('scratch.txt', 's');
+process.stdout.write(JSON.stringify({ type: 'result', isError: false, subtype: 'success', result: 'ok', sessionId: 's' }) + '\\n');
+`, { mode: 0o700 });
+  const { atomicWrite, readState } = await import('../src/durable-store.mjs');
+  const { runWorker } = await import('../src/execution-worker.mjs');
+  const dir = path.join(root, 'e-2');
+  atomicWrite(path.join(dir, 'request.json'), { id: 'e-2', kind: 'talk', prompt: 'hi', workspace, runtime: { bin } });
+  await runWorker(dir);
+  const result = readState(path.join(dir, 'result.json'), null);
+  assert.equal(result.text, 'ok');
+  assert.deepEqual(result.deliverables.files.map(f => path.basename(f)), ['notes.txt']);
+  assert.ok(fs.existsSync(path.join(workspace, '.im', 'remind.mjs')));
 });

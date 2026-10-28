@@ -101,7 +101,7 @@ test('account and user scopes cannot inspect each other or share talk history', 
   await f.app.tick(); await f.app.flushOutbox();
   assert.ok(f.sent.some(s => s.to === 'u2' && /不属于/.test(s.text)));
   const talks = Object.values(f.app.store.state.executions).filter(e => e.kind === 'talk');
-  assert.notEqual(talks[0].historyFile, talks[1].historyFile);
+  assert.notEqual(talks[0].workspace, talks[1].workspace);
 });
 
 test('human draft answers require human mode and talk never reaches the human form', async t => {
@@ -176,11 +176,21 @@ test('host path validation refuses a symlink before creating anything outside th
   assert.equal(fs.existsSync(path.join(outside, 'should-not-exist')), false);
 });
 
-test('talk rejects nonimage files with guidance instead of silently dropping them', async t => {
+test('talk takes documents into its own workspace; voice messages arrive as text only', async t => {
   const f = fixture(t), media = path.join(f.root, 'document.pdf'); fs.writeFileSync(media, 'test');
-  f.send('talk', '总结文件', { mediaPath: media, fileName: 'document.pdf' });
-  await f.app.tick(); await f.app.flushOutbox();
-  assert.equal(f.launches.length, 0); assert.ok(f.sent.some(s => /处理文档/.test(s.text)));
+  f.send('talk', '总结文件', { mediaPath: media, fileName: '../document.pdf' });
+  await f.app.tick();
+  const job = JSON.parse(fs.readFileSync(path.join(f.launches[0], 'request.json')));
+  assert.equal(job.kind, 'talk'); assert.deepEqual(job.images, []);
+  assert.match(job.prompt, /文件：im-inputs\/[0-9a-f]+\/_document\.pdf/, 'a hostile file name stays inside its folder');
+  assert.equal(fs.readFileSync(path.join(job.workspace, job.prompt.match(/文件：(.+)/)[1]), 'utf8'), 'test');
+  f.finish(0);
+  const voice = path.join(f.root, 'voice.wav'); fs.writeFileSync(voice, 'wav');
+  f.app.accept(f.msg('明天八点提醒我开会', { mediaPath: voice, mediaType: 'audio/wav', voiceText: '明天八点提醒我开会' }));
+  await f.app.tick(); await f.app.tick();
+  const second = JSON.parse(fs.readFileSync(path.join(f.launches[1], 'request.json')));
+  assert.doesNotMatch(second.prompt, /附件/); assert.equal(second.resumeSessionId, 'session-0', 'the next turn resumes the chat session');
+  assert.equal(second.workspace, job.workspace);
 });
 
 
@@ -303,7 +313,7 @@ test('talk and tasks reentry create fresh history even when old accepted work is
   await f.app.tick();
   const jobs = Object.values(f.app.store.state.executions);
   const talks = jobs.filter(e => e.kind === 'talk'), ops = jobs.filter(e => e.kind === 'tasks');
-  assert.notEqual(talks[0].historyFile, talks[1].historyFile);
+  assert.notEqual(talks[0].conversationId, talks[1].conversationId); assert.notEqual(talks[0].workspace, talks[1].workspace);
   assert.notEqual(ops[0].opsRoot, ops[1].opsRoot);
   assert.ok(Object.values(f.app.store.state.modeSessions).filter(s => s.closedAt != null).length >= 3);
 });
