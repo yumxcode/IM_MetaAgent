@@ -150,6 +150,7 @@ class WeixinBot {
    *  - media: (msg) => 收到任意媒体消息（已下载，mediaPath 字段填充）
    *  - error: (err) => 轮询或处理错误
    *  - session-expired: (accountId) => 会话过期
+   *  - recovered: ({ accountId, since, downMs }) => 轮询失败或会话过期后首次恢复
    *  - raw: (WeixinMessage, accountId) => 原始消息（最早触发，未经解析）
    */
   on(event, fn) { return this._emitter.on(event, fn); }
@@ -294,6 +295,7 @@ class WeixinBot {
         reloadCredentials: () => { const fresh = this._account(accountId); return { token: fresh.token, baseUrl: fresh.baseUrl }; },
         ackAfterHandle: Boolean(this.inboundHandler),
         onMessage: (raw, id) => this._handleInbound(raw, id),
+        onHealthy: info => this._emitter.emit("recovered", info),
         onError: async err => {
           await this._emitter.emit("error", err);
           if (err.errcode === -14 || err.ret === -14 || err.isStaleToken || err.message?.includes("session expired")) await this._emitter.emit("session-expired", accountId);

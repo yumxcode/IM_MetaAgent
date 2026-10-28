@@ -58,7 +58,7 @@ test('two supervisors for one request execute once and persist the result after 
   assert.equal(fs.readFileSync(sideEffect, 'utf8'), 'once\n');
 });
 
-test('talk persists a separate history with no work tools and replays a saved result without another model call', async t => {
+test('talk persists a separate history with only web/reminder tools and replays a saved result without another model call', async t => {
   const root = temp(t), seen = [];
   class FakeSession {
     constructor(opts) { this.opts = opts; seen.push(opts); }
@@ -69,9 +69,14 @@ test('talk persists a separate history with no work tools and replays a saved re
     interrupt() {}
   }
   const adapter = new RuntimeAdapter(); adapter.native = async () => ({ AgenticSession: FakeSession });
+  adapter.talkWebTools = async () => [{ name: 'web_search' }, { name: 'web_fetch' }];
   const job = { id: 'one', kind: 'talk', prompt: 'hello', workspace: root, historyFile: path.join(root, 'talk.json'), runtime: {} };
   assert.equal((await adapter.execute(job)).text, '答复'); await adapter.execute(job);
-  assert.equal(seen.length, 1); assert.deepEqual(seen[0].tools, []);
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0].tools.map(tool => tool.name), ['web_search', 'web_fetch', 'reminder_create', 'reminder_list', 'reminder_cancel']);
+  assert.equal(seen[0].runtimeDateNotice, true);
+  assert.deepEqual(await seen[0].beforeToolCall('bash', {}), { action: 'deny', reason: '聊天模式不提供该工具' });
+  assert.deepEqual(await seen[0].beforeToolCall('web_fetch', {}), { action: 'allow' });
   await adapter.execute({ ...job, id: 'two' }); assert.equal(seen[1].initialMessages.length, 1);
 });
 
@@ -109,7 +114,8 @@ test('talk delivers image content through the public image constructor', async t
   const adapter = new RuntimeAdapter();
   adapter.native = async () => ({ AgenticSession: Session, makeImageBlockFromFile: async file => { assert.equal(file, '/input.png'); return image; } });
   await adapter.execute({ id: 'image', kind: 'talk', prompt: '描述图片', mediaPath: '/input.png', workspace: root, historyFile: path.join(root, 'chat.json'), runtime: {} });
-  assert.deepEqual(submitted[0], [{ type: 'text', text: '描述图片' }, image]);
+  assert.equal(submitted[0].length, 2); assert.deepEqual(submitted[0][1], image);
+  assert.match(submitted[0][0].text, /^\[当前本机时间：\d{4}-\d{2}-\d{2} 周.+\]\n描述图片$/);
 });
 
 test('one runtime root selects both execution CLIs', () => {

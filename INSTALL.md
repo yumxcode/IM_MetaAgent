@@ -1,3 +1,5 @@
+> 1.3.0 升级说明：未设置 `WEIXIN_ALLOW_FROM` 时改为**仅主人可用**（首位私聊者绑定；已有唯一私聊联系人直接沿用；有多个历史联系人时拒绝所有消息，需设置白名单或 `npm run agent -- --bind-owner <ID>`）。新增掉线告警、日志轮转、聊天联网与提醒、交付文件回传、待决策回复和 30 天数据清理，配置见 `.env.example`；`deploy/start.sh` 有改动，更新后重启服务即可，无需重装。
+
 > 1.2.0 升级要求：先构建含 `@meta-agent/runtime/im` 契约 v1 的 runtime。设置 `META_AGENT_RUNTIME_DIR=/absolute/path/to/meta_agent_runtime`，或升级独立安装并确保 CLI 与公开接口来自同一构建。微信先单独发送 `/tasks`、`/human`、`/talk` 或 `/auto` 进入模式，随后直接发内容，单独发送对应 `xxx/` 退出。旧入口不再触发，旧资料保留。详见 [P0 说明](docs/p0-personal-agent.md)。
 
 # IM_MetaAgent 1.1.4 远端安装与更新

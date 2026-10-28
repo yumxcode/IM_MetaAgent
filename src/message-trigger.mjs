@@ -30,7 +30,7 @@ export function parseModeMessage(value, current, { hasMedia = false } = {}) {
 }
 
 export function parseAgentTrigger(msg, cfg = {}, current) {
-  if (cfg.allowFrom?.length && !cfg.allowFrom.includes(msg.fromUserId)) return { action: 'ignore' };
+  if (cfg.allowFrom?.length && !cfg.allowFrom.includes('*') && !cfg.allowFrom.includes(msg.fromUserId)) return { action: 'ignore' };
   if (msg.groupId && cfg.groupTrigger === 'off') return { action: 'ignore' };
   return parseModeMessage(msg.commandText ?? msg.text, current, { hasMedia: Boolean(msg.mediaPath || msg.mediaItem) });
 }

@@ -16,21 +16,118 @@ const LOG_LEVELS = { trace: 10, debug: 20, info: 30, warn: 40, error: 50, fatal:
 const ENV_LEVEL = (process.env.WEIXIN_LOG_LEVEL || "").toLowerCase();
 
 /**
+ * Size-rotated log file: file → file.1 → … → file.N. Synchronous appends keep
+ * ordering simple; only the long-lived bot process opens one (workers keep stderr).
+ */
+export class RotatingLogFile {
+  constructor(file, { maxBytes = 10 * 1024 * 1024, keep = 5 } = {}) {
+    this.file = path.resolve(file); this.maxBytes = Math.max(4096, maxBytes); this.keep = Math.max(1, keep);
+    fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
+    this.open();
+  }
+  open() {
+    this.fd = fs.openSync(this.file, "a", 0o600);
+    this.size = fs.fstatSync(this.fd).size;
+  }
+  rotate() {
+    try { fs.closeSync(this.fd); } catch { /* already closed */ }
+    for (let i = this.keep - 1; i >= 1; i--) {
+      try { fs.renameSync(`${this.file}.${i}`, `${this.file}.${i + 1}`); } catch (err) { if (err.code !== "ENOENT") throw err; }
+    }
+    try { fs.renameSync(this.file, `${this.file}.1`); } catch (err) { if (err.code !== "ENOENT") throw err; }
+    this.open();
+  }
+  write(line) {
+    const bytes = Buffer.byteLength(line);
+    if (this.size > 0 && this.size + bytes > this.maxBytes) this.rotate();
+    fs.writeSync(this.fd, line); this.size += bytes;
+  }
+  close() { try { fs.closeSync(this.fd); } catch { /* ignore */ } }
+}
+
+/**
+ * Repeated warn/error lines (same level, message and metadata) are written once
+ * per window; the suppressed count is reported when the window ends.
+ */
+export class RepeatSuppressor {
+  constructor({ windowMs = 5 * 60 * 1000, maxKeys = 500, now = Date.now } = {}) {
+    this.windowMs = windowMs; this.maxKeys = maxKeys; this.now = now; this.entries = new Map();
+  }
+  /** Returns null to suppress, or { note } to emit (note describes earlier suppression). */
+  check(key) {
+    const at = this.now(), entry = this.entries.get(key);
+    if (entry && at - entry.since < this.windowMs) { entry.suppressed++; entry.last = at; return null; }
+    const note = entry?.suppressed ? entry.suppressed : 0;
+    this.entries.delete(key); this.entries.set(key, { since: at, last: at, suppressed: 0 });
+    if (this.entries.size > this.maxKeys) this.entries.delete(this.entries.keys().next().value);
+    return { suppressedBefore: note };
+  }
+  /** Close finished windows that suppressed something; returns [{ key, count, since, last }]. */
+  drain() {
+    const at = this.now(), out = [];
+    for (const [key, entry] of this.entries) {
+      if (at - entry.since < this.windowMs) continue;
+      if (entry.suppressed) out.push({ key, count: entry.suppressed, since: entry.since, last: entry.last });
+      this.entries.delete(key);
+    }
+    return out;
+  }
+}
+
+/**
  * 简易分级日志。默认 info，可通过环境变量 WEIXIN_LOG_LEVEL 调整。
- * 输出到 stderr，避免污染 stdout（stdout 留给 QR 渲染等用户可见输出）。
+ * 默认输出到 stderr（stdout 留给 QR 渲染等用户可见输出）；常驻进程可调用
+ * log.useFile() 改写到按大小轮转的文件。warn/error 的重复行按窗口合并计数。
  */
 export const log = {
   _level: LOG_LEVELS[ENV_LEVEL] ?? LOG_LEVELS.info,
+  _sink: null,
+  _repeat: new RepeatSuppressor({ windowMs: Number(process.env.IM_LOG_REPEAT_WINDOW_MS) || 5 * 60 * 1000 }),
+  _drainTimer: null,
   setLevel(level) {
     const l = LOG_LEVELS[String(level).toLowerCase()];
     if (l === undefined) throw new Error(`invalid log level: ${level}`);
     this._level = l;
   },
+  /** Route log lines to a rotating file. Returns the sink (or null when file is empty). */
+  useFile(file, { maxBytes, keep } = {}) {
+    this._sink?.close(); this._sink = null;
+    if (!file) return null;
+    this._sink = new RotatingLogFile(file, { maxBytes, keep });
+    return this._sink;
+  },
+  closeFile() { this._sink?.close(); this._sink = null; },
+  _write(line) {
+    if (this._sink) {
+      try { this._sink.write(line); return; }
+      catch { /* fall back to stderr below */ }
+    }
+    process.stderr.write(line);
+  },
+  _flushRepeats() {
+    for (const item of this._repeat.drain()) {
+      const [level, msg] = JSON.parse(item.key);
+      const seconds = Math.max(1, Math.round((item.last - item.since) / 1000));
+      this._write(`${new Date().toISOString()} [${level}] (重复 ${item.count} 次，${seconds}s 内已合并) ${msg}\n`);
+    }
+  },
   _emit(level, msg, meta) {
     if (LOG_LEVELS[level] < this._level) return;
+    const metaText = meta ? safeJson(meta) : "";
+    let prefix = "";
+    if (LOG_LEVELS[level] >= LOG_LEVELS.warn) {
+      const decision = this._repeat.check(JSON.stringify([level, msg, metaText]));
+      if (!decision) {
+        if (!this._drainTimer) {
+          this._drainTimer = setInterval(() => this._flushRepeats(), Math.min(this._repeat.windowMs, 60_000));
+          this._drainTimer.unref?.();
+        }
+        return;
+      }
+      if (decision.suppressedBefore) prefix = `(此前已合并 ${decision.suppressedBefore} 次重复) `;
+    }
     const ts = new Date().toISOString();
-    const line = meta ? `${ts} [${level}] ${msg} ${safeJson(meta)}` : `${ts} [${level}] ${msg}`;
-    process.stderr.write(line + "\n");
+    this._write(metaText ? `${ts} [${level}] ${prefix}${msg} ${metaText}\n` : `${ts} [${level}] ${prefix}${msg}\n`);
   },
   trace(msg, meta) { this._emit("trace", msg, meta); },
   debug(msg, meta) { this._emit("debug", msg, meta); },

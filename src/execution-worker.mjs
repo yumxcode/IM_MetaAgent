@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { atomicWrite, readState } from './durable-store.mjs';
+import { declaredPathsFromEvent, collectDeliverables } from './deliverables.mjs';
 
 export async function runWorker(directory, { adapterFactory } = {}) {
   const job = readState(path.join(directory, 'request.json'), null);
@@ -12,7 +13,8 @@ export async function runWorker(directory, { adapterFactory } = {}) {
   let claim;
   try { claim = fs.openSync(path.join(directory, 'started.json'), 'wx', 0o600); }
   catch (error) { if (error.code === 'EEXIST') return; throw error; }
-  try { fs.writeFileSync(claim, JSON.stringify({ pid: process.pid, id: job.id, at: Date.now() })); fs.fsyncSync(claim); }
+  const startedAt = Date.now();
+  try { fs.writeFileSync(claim, JSON.stringify({ pid: process.pid, id: job.id, at: startedAt })); fs.fsyncSync(claim); }
   finally { fs.closeSync(claim); }
   // Process-local settings, before importing anything that caches model config.
   if (job.runtime.profile) process.env.META_AGENT_CONFIG_FILE = job.runtime.profile;
@@ -21,6 +23,7 @@ export async function runWorker(directory, { adapterFactory } = {}) {
   const abort = () => controller.abort();
   process.once('SIGTERM', abort); process.once('SIGINT', abort);
   let eventCount = 0;
+  const declared = [];
   const heartbeat = () => {
     atomicWrite(path.join(directory, 'heartbeat.json'), { pid: process.pid, id: job.id, at: Date.now() });
     if (fs.existsSync(path.join(directory, 'cancel.json'))) controller.abort();
@@ -55,6 +58,7 @@ export async function runWorker(directory, { adapterFactory } = {}) {
       result = await adapter.execute(job, { signal: controller.signal, onEvent(event) {
         // Persist identity and the latest progress; avoid an unbounded transcript copy.
         if (event.sessionId) atomicWrite(path.join(directory, 'session.json'), { sessionId: event.sessionId });
+        for (const file of declaredPathsFromEvent(event)) if (declared.length < 200) declared.push(file);
         if (++eventCount % 10 === 0 || ['tool_use', 'result'].includes(event.type)) {
           atomicWrite(path.join(directory, 'progress.json'), { at: Date.now(), type: event.type,
             toolName: event.toolName, sessionId: event.sessionId });
@@ -63,6 +67,11 @@ export async function runWorker(directory, { adapterFactory } = {}) {
     }
   } catch (error) { result = { ok: false, text: '', subtype: controller.signal.aborted ? 'cancelled' : 'worker_error', errors: [error.message] }; }
   finally { clearInterval(timer); process.removeListener('SIGTERM', abort); process.removeListener('SIGINT', abort); }
+  if (job.kind === 'auto' && job.workspace) {
+    // Files are reported, not sent, here: the bot applies size/count limits and owns delivery.
+    try { const found = collectDeliverables({ workspace: job.workspace, declared, since: startedAt - 1000 }); if (found.files.length) result = { ...result, deliverables: found }; }
+    catch (error) { result = { ...result, deliverableError: error.message }; }
+  }
   atomicWrite(path.join(directory, 'result.json'), { ...result, requestId: job.id, completedAt: Date.now() });
 }
 

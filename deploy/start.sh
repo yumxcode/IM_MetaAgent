@@ -51,6 +51,18 @@ if ! "$NODE_BIN" --input-type=module -e 'import { assertSupportedNode } from "./
   exit 1
 fi
 
+# 应用日志写入按大小轮转的文件（IM_LOG_FILE=stderr 可恢复旧行为）；
+# 服务管理器的 stdout/stderr 文件此后只承接启动信息和崩溃堆栈，超过 20MB 时保留末尾 1MB。
+export IM_LOG_FILE="${IM_LOG_FILE:-$PROJECT_DIR/logs/im-metaagent.log}"
+trim_log() {
+  local file="$1" max=$((20 * 1024 * 1024))
+  if [ -f "$file" ] && [ "$(( $(wc -c < "$file") ))" -gt "$max" ]; then
+    tail -c 1048576 "$file" > "$file.1" && : > "$file"
+  fi
+}
+trim_log "$PROJECT_DIR/logs/im-metaagent.out.log"
+trim_log "$PROJECT_DIR/logs/im-metaagent.err.log"
+
 echo "[start.sh] $(date '+%Y-%m-%dT%H:%M:%S') starting: ${NODE_BIN} weixin-meta-agent.mjs (PATH meta-agent: $(command -v meta-agent 2>/dev/null || echo '未找到'))"
 
 # exec 替换进程，让守护工具直接管理 node（收到 SIGTERM 能优雅退出）

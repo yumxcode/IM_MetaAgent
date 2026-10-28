@@ -7,11 +7,31 @@ import { DurableStore, atomicWrite, readState, digest, identityOf, processAlive,
 import { parseAgentTrigger, COMMAND_HELP, MODE_NAMES } from './message-trigger.mjs';
 import { RuntimeAdapter } from './runtime-adapter.mjs';
 import { projectPath, validateCloneUrl, containedDirectory } from './project-store.mjs';
+import { runBoundedCommand } from './meta-agent-tasks.mjs';
+import { planSchedule, advanceSchedule, describeSchedule, formatLocal, MAX_ACTIVE_SCHEDULES } from './schedules.mjs';
+import { mediaKind } from './deliverables.mjs';
 
 const workerFile = fileURLToPath(new URL('./execution-worker.mjs', import.meta.url));
 const ACTIVE = new Set(['queued', 'running']);
 const AUTO_NAV = /^(?:A\d+|(?:选择|use)\s+A\d+|list|列表|任务|new|新建)$/i;
 const chunks = text => String(text || '（没有文本结果）').match(/[\s\S]{1,2600}/gu) || [''];
+const DAY = 24 * 60 * 60 * 1000;
+const DECISION_MARK = /【待决策\s*(A\d+)】/;
+const MODE_TOKEN = /^(?:\/(?:tasks|human|talk|auto)|(?:tasks|human|talk|auto)\/)$/i;
+const originOf = msg => ({ accountId: msg.accountId, fromUserId: msg.fromUserId, ...(msg.groupId ? { groupId: msg.groupId } : {}) });
+const isPrivateContactKey = key => { try { const parsed = JSON.parse(key); return parsed[2] === 'private'; } catch { return false; } };
+
+/** A reply to a 【待决策 A1】 notice, or an explicit `决定 A1 …`, outside human-form mode. */
+export function parseDecisionMessage(msg, current) {
+  if (current?.kind === 'human') return null;
+  const own = String(msg.commandText ?? msg.text ?? '').trim();
+  const explicit = /^(?:决定|decide)\s+(A\d+)\s+([\s\S]+)$/i.exec(own);
+  if (explicit) return { taskId: explicit[1].toUpperCase(), prompt: explicit[2].trim() };
+  if (!own || MODE_TOKEN.test(own)) return null;
+  const quoted = [msg.quoteContext, ...(msg.quotes || []).map(q => `${q.title || ''} ${q.body || ''}`)].filter(Boolean).join('\n');
+  const marker = DECISION_MARK.exec(quoted);
+  return marker ? { taskId: marker[1].toUpperCase(), prompt: own } : null;
+}
 
 export function parseAutoRequest(prompt) {
   const m = /^--(continue|steer)\s+(A\d+)(?:\s+([\s\S]+))?$/i.exec(prompt);
@@ -27,9 +47,13 @@ export function parseAutoRequest(prompt) {
 }
 
 export class PersonalAgent {
-  constructor({ root, bot, cfg = {}, adapter = new RuntimeAdapter(), launcher, now = Date.now, log = console, lock = true }) {
+  constructor({ root, bot, cfg = {}, adapter = new RuntimeAdapter(), launcher, now = Date.now, log = console, lock = true, alerts = null, runtimeCall }) {
     this.store = new DurableStore(root, { lock }); this.root = this.store.root;
-    this.bot = bot; this.cfg = { maxConcurrent: 2, ...cfg }; this.adapter = adapter; this.now = now; this.log = log;
+    this.bot = bot; this.adapter = adapter; this.now = now; this.log = log; this.alerts = alerts;
+    this.cfg = { maxConcurrent: 2, retentionDays: 30, decisionPollMs: 120000, sendFiles: true, sendFilesMax: 5,
+      sendFileMaxBytes: 25 * 1024 * 1024, ...cfg };
+    this.runtimeCall = runtimeCall || ((capability, input) => this.callRuntime(capability, input));
+    this.deniedSeen = new Set(); this.nextDecisionCheck = 0;
     this.launcher = launcher || (directory => {
       const logFile = fs.openSync(path.join(directory, 'worker.log'), 'a', 0o600);
       try {
@@ -41,9 +65,39 @@ export class PersonalAgent {
     });
     this.processing = new Set(); this.stopped = false;
     this.store.update(state => {
-      state.modes ??= {}; state.modeSessions ??= {};
+      state.modes ??= {}; state.modeSessions ??= {}; state.schedules ??= {}; state.nextSchedule ??= 1;
       for (const item of Object.values(state.inbox)) if (item.status === 'processing') item.status = 'queued';
+      if (!this.ownerMode() || state.owner) return;
+      // Upgrade: an existing single private contact is the owner; several are ambiguous and fail closed.
+      const users = new Set(Object.entries(state.contacts).filter(([key]) => isPrivateContactKey(key)).map(([, c]) => c.userId).filter(Boolean));
+      if (users.size === 1) state.owner = { userId: [...users][0], boundAt: this.now(), via: 'migrated' };
+      state.ownerAmbiguous = users.size > 1;
     });
+    if (this.store.state.ownerAmbiguous && !this.store.state.owner) {
+      const text = '检测到多个历史私聊联系人，无法自动确定机器人主人，已拒绝所有消息。请设置 WEIXIN_ALLOW_FROM，或运行 npm run agent -- --owner 查看并用 --bind-owner <用户ID> 绑定。';
+      this.log.error?.(text); this.alerts?.send(text, { key: 'owner-ambiguous', minIntervalMs: DAY });
+    }
+  }
+  /** No WEIXIN_ALLOW_FROM: only the bound owner (first private sender) may use the bot. */
+  ownerMode() { return !(this.cfg.allowFrom || []).length; }
+  access(msg) {
+    const allow = this.cfg.allowFrom || [];
+    if (allow.includes('*')) return 'allow';
+    if (allow.length) return allow.includes(msg.fromUserId) ? 'allow' : 'deny';
+    const owner = this.store.state.owner;
+    if (owner) return owner.userId === msg.fromUserId ? 'allow' : 'deny';
+    if (this.store.state.ownerAmbiguous || msg.groupId || !msg.fromUserId) return 'deny';
+    return 'bind';
+  }
+  denied(msg) {
+    const who = String(msg.fromUserId || '?');
+    this.log.warn?.(`已拒绝非授权用户的消息：${who}${msg.groupId ? `（群 ${msg.groupId}）` : ''}`);
+    if (this.deniedSeen.has(who)) return;
+    this.deniedSeen.add(who);
+    this.alerts?.send(`已拒绝非授权用户 ${who} 发给机器人的消息${msg.groupId ? '（群聊）' : ''}。如需放行，请把该 ID 加入 WEIXIN_ALLOW_FROM。`, { key: `stranger:${who}`, minIntervalMs: DAY });
+  }
+  bindOwner(userId, via) {
+    this.store.update(state => { state.owner = { userId, boundAt: this.now(), via }; delete state.ownerAmbiguous; });
   }
   setHumanTasks(service) { this.human = service; }
   humanBot() {
@@ -51,13 +105,59 @@ export class PersonalAgent {
       sendText: options => this.bot.sendText(options),
       reply: async (msg, text) => { this.reply(msg, text, 'human'); return { queued: true }; } };
   }
-  addReply(state, msg, text, key) {
+  addReply(state, msg, text, key, { fallbackAlert = false } = {}) {
     const owner = identityOf(msg);
     chunks(text).forEach((part, index) => {
       const id = digest(`${owner}:${key}:${index}`);
       state.outbox[id] ??= { id, owner, accountId: msg.accountId, to: msg.fromUserId, text: part,
-        status: 'pending', attempts: 0, retryAt: 0, createdAt: this.now() };
+        status: 'pending', attempts: 0, retryAt: 0, createdAt: this.now(), ...(fallbackAlert ? { fallbackAlert: true } : {}) };
     });
+  }
+  addFile(state, msg, file, key) {
+    const owner = identityOf(msg), id = digest(`${owner}:${key}`);
+    state.outbox[id] ??= { id, owner, accountId: msg.accountId, to: msg.fromUserId, kind: 'file', filePath: file.path,
+      fileName: file.name, mediaKind: mediaKind(file.name), status: 'pending', attempts: 0, retryAt: 0, createdAt: this.now() };
+  }
+  activeSchedules(state, owner) {
+    return Object.values(state.schedules || {}).filter(s => s.owner === owner && s.enabled)
+      .map(({ id, kind, text, cron, at, nextAt }) => ({ id, kind, text, cron, at, nextAt }));
+  }
+  /** Where to send unsolicited messages about a task (decisions). */
+  originFor(state, task) {
+    if (task.origin) return task.origin;
+    for (const e of Object.values(state.executions)) {
+      if (e.taskId === task.id && state.inbox[e.inboxId]?.msg) return originOf(state.inbox[e.inboxId].msg);
+    }
+    try { const [accountId, fromUserId, group] = JSON.parse(task.owner); return { accountId, fromUserId, ...(group !== 'private' ? { groupId: group } : {}) }; }
+    catch { return null; }
+  }
+  applyScheduleOps(state, owner, origin, ops = []) {
+    const lines = [];
+    for (const op of ops) {
+      try {
+        if (op.type === 'create') {
+          if (this.activeSchedules(state, owner).length >= MAX_ACTIVE_SCHEDULES) throw new Error(`最多 ${MAX_ACTIVE_SCHEDULES} 个有效提醒`);
+          // Re-validate: the worker's proposal is data, and time has moved on since.
+          let plan;
+          if (op.cron) plan = planSchedule({ text: op.text, kind: op.kind, cron: op.cron }, this.now());
+          else {
+            const text = String(op.text || '').trim().slice(0, 2000), at = Number(op.at);
+            if (!text) throw new Error('提醒内容为空');
+            if (!(at > this.now())) throw new Error(`时间 ${Number.isFinite(at) ? formatLocal(at, this.now()) : ''} 已过`);
+            plan = { kind: op.kind === 'talk' ? 'talk' : 'remind', text, at, nextAt: at };
+          }
+          const id = `R${state.nextSchedule++}`;
+          state.schedules[id] = { id, owner, origin, ...plan, enabled: true, createdAt: this.now(), runs: 0 };
+          lines.push(`⏰ 已创建 ${describeSchedule(state.schedules[id], this.now())}`);
+        } else if (op.type === 'cancel') {
+          const schedule = state.schedules[op.id];
+          if (!schedule || schedule.owner !== owner || !schedule.enabled) throw new Error(`没有有效的提醒 ${op.id}`);
+          schedule.enabled = false; schedule.cancelledAt = this.now();
+          lines.push(`已取消 ${op.id}`);
+        }
+      } catch (error) { lines.push(`提醒未生效：${error.message}`); }
+    }
+    return lines;
   }
   reply(msg, text, key = 'reply') {
     this.store.update(state => this.addReply(state, msg, text, `${msg.inboxId || msg.messageId}:${key}:${digest(text)}`));
@@ -66,7 +166,11 @@ export class PersonalAgent {
   accept(msg) {
     if (this.stopped) throw new Error('IM is stopping; leave this message unacknowledged');
     const owner = identityOf(msg);
-    const route = parseAgentTrigger(msg, this.cfg, this.store.state.modes[owner]);
+    const access = this.access(msg);
+    if (access === 'deny') { this.denied(msg); return; }
+    const current = this.store.state.modes[owner];
+    const decision = parseDecisionMessage(msg, current);
+    let route = decision ? { action: 'decision', ...decision } : parseAgentTrigger(msg, { ...this.cfg, allowFrom: [] }, current);
     if (route.action === 'ignore') return;
     // iLink normally supplies message_id; stable seq+timestamp fallback is safe for redelivery.
     const transportId = msg.messageId ?? (msg.seq != null ? `seq:${msg.seq}` : null);
@@ -80,11 +184,26 @@ export class PersonalAgent {
       if (!fs.existsSync(stored.mediaPath)) copyDurableFile(msg.mediaPath, stored.mediaPath);
     }
     this.store.update(state => {
+      if (access === 'bind' && !state.owner && !state.inbox[id]) {
+        state.owner = { userId: msg.fromUserId, accountId: msg.accountId, boundAt: this.now(), via: 'first-message' };
+        delete state.ownerAmbiguous;
+        this.addReply(state, stored, '已将你绑定为这个机器人的唯一主人；其他人的消息会被拒绝。需要放行他人时，在运行机器人的电脑上设置 WEIXIN_ALLOW_FROM。', `${id}:owner`);
+        this.alerts?.send(`机器人已绑定主人：${msg.fromUserId}（首条私聊）。如果不是你本人，请立即停止服务并检查。`, { key: `owner:${msg.fromUserId}`, minIntervalMs: DAY });
+      }
       if (msg.contextToken) {
         state.contacts[owner] = { accountId: msg.accountId, userId: msg.fromUserId, token: msg.contextToken };
         for (const item of Object.values(state.outbox)) if (item.owner === owner && item.status === 'pending') item.retryAt = 0;
       }
       if (state.inbox[id]) return;
+      if (route.action === 'decision') {
+        const task = state.tasks[route.taskId];
+        if (!task || task.owner !== owner) {
+          state.inbox[id] = { id, owner, msg: stored, route, status: 'done', createdAt: this.now() };
+          this.addReply(state, stored, `没有找到你的任务 ${route.taskId}。`, `${id}:decision`); return;
+        }
+        state.inbox[id] = { id, owner, msg: stored, route, status: 'queued', createdAt: this.now() };
+        return;
+      }
       if (route.action === 'enter' || route.action === 'exit') {
         if (route.action === 'enter') {
           const sessionId = randomUUID();
@@ -149,8 +268,19 @@ export class PersonalAgent {
   routeExecution(item) {
     const { route, owner, msg } = item;
     this.store.update(state => {
+      if (route.action === 'decision') {
+        const task = this.ownedTask(state, owner, route.taskId);
+        if (ACTIVE.has(task.status)) throw new Error(`${task.id} 正在执行或排队，稍后再回复决定。`);
+        if (!task.sessionId) throw new Error(`${task.id} 尚未取得 runtime 会话编号，不能交付决定。`);
+        task.status = 'queued'; task.origin ??= originOf(msg);
+        task.executionId = this.enqueueExecution(state, item, { kind: 'auto', taskId: task.id, workspace: task.workspace, mode: task.mode,
+          runtime: task.runtime, intent: 'steer', resumeSessionId: task.sessionId, prompt: route.prompt, images: [] });
+        if (task.decision) task.decision.answeredAt = this.now();
+        this.addReply(state, msg, `已把你的决定交给 ${task.id}，任务继续执行，结果会发到这里。`, `${item.id}:decision`);
+        return;
+      }
       if (route.action === 'talk') {
-        const conversationKey = route.modeSessionId || owner;
+        const conversationKey = route.scheduleId ? `schedule:${route.scheduleId}` : route.modeSessionId || owner;
         if (msg.mediaPath && !/\.(png|jpe?g|webp|gif)$/i.test(msg.mediaPath)) throw new Error('聊天支持文本和图片；处理文档、音视频等文件请先退出 talk/，再进入 /auto。');
         if (route.prompt === '--clear') {
           if (Object.values(state.executions).some(e => e.owner === owner && e.kind === 'talk' && ACTIVE.has(e.status))) throw new Error('聊天还在处理中，请稍后清理。');
@@ -160,7 +290,8 @@ export class PersonalAgent {
         const conversation = state.conversations[conversationKey] ??= { id: randomUUID() };
         const workspace = containedDirectory(this.root, path.join(this.root, 'talk', digest(owner).slice(0, 24)));
         this.enqueueExecution(state, item, { kind: 'talk', workspace, historyFile: path.join(workspace, `${conversation.id}.json`),
-          prompt: [msg.quoteContext, route.prompt].filter(Boolean).join('\n'), mediaPath: msg.mediaPath, mediaType: msg.mediaType });
+          prompt: [msg.quoteContext, route.prompt].filter(Boolean).join('\n'), mediaPath: msg.mediaPath, mediaType: msg.mediaType,
+          schedules: this.activeSchedules(state, owner), ...(route.scheduleId ? { scheduleId: route.scheduleId } : {}) });
         return;
       }
       if (route.action === 'tasks') {
@@ -195,7 +326,7 @@ export class PersonalAgent {
         const projectKey = state.selectedProjects[owner], project = projectKey && state.projects[projectKey];
         if (project && project.status !== 'ready') throw new Error('当前项目未就绪');
         const workspace = containedDirectory(this.root, project?.path || path.join(this.root, 'workspaces', digest(owner).slice(0, 24), id));
-        task = state.tasks[id] = { id, owner, mode: request.mode, workspace, projectKey: projectKey || null,
+        task = state.tasks[id] = { id, owner, origin: originOf(msg), mode: request.mode, workspace, projectKey: projectKey || null,
           goal: request.prompt, runtime: this.runtimeSettings('auto'), createdAt: this.now(), status: 'queued' };
       } else {
         task = this.ownedTask(state, owner, request.target);
@@ -240,6 +371,12 @@ export class PersonalAgent {
       } else atomicWrite(path.join(this.directory(execution.id), 'cancel.json'), { requestedAt: this.now() });
       return reply('已提交取消当前执行轮的请求。runtime 已交接的后台作业或后续唤醒需另行通过 /tasks 管理。');
     }
+    if (/^(?:提醒|定时|reminders?|schedules?)$/i.test(prompt)) {
+      const list = this.activeSchedules(state, owner);
+      return reply(list.length ? list.map(s => describeSchedule(s, this.now())).join('\n') + '\n取消：cancel R1' : '当前没有提醒或定时任务。在 /talk 中直接说“明天 8 点提醒我…”即可创建。');
+    }
+    const cancelSchedule = /^(?:cancel|取消)\s+(R\d+)$/i.exec(prompt);
+    if (cancelSchedule) return reply(this.applyScheduleOps(state, owner, originOf(msg), [{ type: 'cancel', id: cancelSchedule[1].toUpperCase() }]).join('\n'));
     if (!/^project(?:\s|$)/i.test(prompt)) return false;
     const [, action = 'list', name, url, ...extra] = prompt.split(/\s+/);
     if (extra.length) throw new Error('项目命令参数过多');
@@ -283,6 +420,7 @@ export class PersonalAgent {
         }
         if (taskId && ACTIVE.has(this.store.state.tasks[taskId]?.status)) continue;
       }
+      if (item.route.action === 'decision' && ACTIVE.has(this.store.state.tasks[item.route.taskId]?.status)) continue;
       try {
         if (item.route.action !== 'human') { this.routeExecution(item); continue; }
         if (this.processing.has(item.owner)) continue;
@@ -302,7 +440,26 @@ export class PersonalAgent {
       }
     }
   }
+  /** Snapshot reported deliverables into the bot's own directory, within count/size limits. */
+  prepareDeliverables(execution, result) {
+    const found = result.deliverables?.files || [];
+    if (!found.length || !this.cfg.sendFiles) return { send: [], skipped: found };
+    const send = [], skipped = []; let total = 0;
+    const dir = path.join(this.root, 'outbox-files', execution.id);
+    for (const file of found) {
+      let stat; try { stat = fs.statSync(file); } catch { skipped.push(file); continue; }
+      if (send.length >= this.cfg.sendFilesMax || stat.size > this.cfg.sendFileMaxBytes || total + stat.size > 4 * this.cfg.sendFileMaxBytes || !stat.size) { skipped.push(file); continue; }
+      try {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        const target = path.join(dir, `${send.length + 1}-${path.basename(file)}`);
+        if (!fs.existsSync(target)) copyDurableFile(file, target);
+        send.push({ path: target, name: path.basename(file) }); total += stat.size;
+      } catch (error) { this.log.warn?.(`交付文件复制失败：${error.message}`); skipped.push(file); }
+    }
+    return { send, skipped };
+  }
   settle(execution, result, status) {
+    const files = execution.kind === 'auto' && result.deliverables ? this.prepareDeliverables(execution, result) : { send: [], skipped: [] };
     this.store.update(state => {
       const e = state.executions[execution.id];
       if (e.status !== 'running') return;
@@ -317,10 +474,17 @@ export class PersonalAgent {
       }
       if (e.projectKey) state.projects[e.projectKey].status = result.ok ? 'ready' : 'failed';
       const item = state.inbox[e.inboxId];
-      const prefix = e.taskId ? `${e.taskId} 本次执行${result.ok ? '已返回' : '未完成'}\n` : '';
+      const prefix = e.taskId ? `${e.taskId} 本次执行${result.ok ? '已返回' : '未完成'}\n` : e.scheduleId ? `⏰ 定时任务 ${e.scheduleId}\n` : '';
+      const extra = [];
+      if (result.scheduleOps?.length) extra.push(...this.applyScheduleOps(state, e.owner, originOf(item.msg), result.scheduleOps));
+      if (files.send.length) extra.push(`📎 交付文件 ${files.send.length} 个，随后发送：${files.send.map(f => f.name).join('、')}`);
+      if (files.skipped.length) extra.push(`未通过微信发送的文件（数量或大小超限）：\n${files.skipped.slice(0, 10).join('\n')}`);
       this.addReply(state, item.msg, prefix + (result.text || result.errors?.join('\n') || `执行结果：${result.subtype}`) +
-        (!result.ok && result.text ? `\n状态：${result.subtype}` : ''), `${e.id}:result`);
+        (!result.ok && result.text ? `\n状态：${result.subtype}` : '') + (extra.length ? `\n\n${extra.join('\n')}` : ''), `${e.id}:result`);
+      files.send.forEach((file, index) => this.addFile(state, item.msg, file, `${e.id}:file:${index}`));
     });
+    // A run that parked for a decision shows up in the runtime task list right away.
+    if (execution.kind === 'auto') this.nextDecisionCheck = Math.min(this.nextDecisionCheck || Infinity, this.now() + 2000);
   }
   async monitorAndLaunch() {
     for (const e of Object.values(this.store.state.executions)) {
@@ -369,6 +533,22 @@ export class PersonalAgent {
       catch (error) { this.settle(e, { ok: false, subtype: 'spawn_failed', errors: [error.message] }); }
     }
   }
+  async sendEntry(entry, token) {
+    if (entry.kind !== 'file') return this.bot.sendText({ accountId: entry.accountId, to: entry.to, text: entry.text,
+      contextToken: token, clientId: `im:${entry.id.slice(0, 48)}`, timeoutMs: 3000 });
+    const method = { image: 'sendImageFile', video: 'sendVideoFile' }[entry.mediaKind] || 'sendFileAttachment';
+    if (typeof this.bot[method] !== 'function') throw Object.assign(new Error('当前微信接入不支持发送文件'), { permanent: true });
+    if (!fs.existsSync(entry.filePath)) throw Object.assign(new Error('交付文件已不存在'), { permanent: true });
+    return this.bot[method]({ accountId: entry.accountId, to: entry.to, filePath: entry.filePath, contextToken: token, timeoutMs: 120000 });
+  }
+  /** Reminders that WeChat could not deliver for 10 minutes also go to the alert channel. */
+  escalateUndelivered() {
+    if (!this.alerts) return;
+    const due = Object.values(this.store.state.outbox).filter(e => e.fallbackAlert && e.status === 'pending' && !e.alertedAt && this.now() - e.createdAt > 10 * 60 * 1000);
+    if (!due.length) return;
+    for (const entry of due) this.alerts.send(`微信暂时无法送达（${entry.error || '缺少会话凭据'}），提醒内容：\n${entry.text}`);
+    this.store.update(state => { for (const entry of due) state.outbox[entry.id].alertedAt = this.now(); });
+  }
   async flushOutbox() {
     const blocked = new Set(); let sent = 0;
     for (const entry of Object.values(this.store.state.outbox)) {
@@ -377,21 +557,160 @@ export class PersonalAgent {
       const contact = this.store.state.contacts[entry.owner];
       if (!contact?.token) { blocked.add(entry.owner); continue; }
       try {
-        const receipt = await this.bot.sendText({ accountId: entry.accountId, to: entry.to, text: entry.text,
-          contextToken: contact.token, clientId: `im:${entry.id.slice(0, 48)}`, timeoutMs: 3000 });
-        this.store.update(state => { state.outbox[entry.id].status = 'sent'; state.outbox[entry.id].receipt = receipt; });
+        const receipt = await this.sendEntry(entry, contact.token);
+        this.store.update(state => { state.outbox[entry.id].status = 'sent'; state.outbox[entry.id].sentAt = this.now(); state.outbox[entry.id].receipt = receipt; });
         if (++sent >= 10) break;
       } catch (error) {
+        if (error.permanent) {
+          this.store.update(state => { state.outbox[entry.id].status = 'failed'; state.outbox[entry.id].error = error.message; });
+          continue;
+        }
         blocked.add(entry.owner);
         this.store.update(state => { const item = state.outbox[entry.id]; item.attempts++; item.error = error.message;
           item.retryAt = this.now() + Math.min(300000, 1000 * 2 ** Math.min(item.attempts, 8)); });
       }
     }
+    this.escalateUndelivered();
+  }
+  /** Fire due reminders (outbox) and scheduled chat prompts (queued like inbound talk). */
+  runSchedules() {
+    const now = this.now();
+    const due = Object.values(this.store.state.schedules || {}).filter(s => s.enabled && s.nextAt <= now);
+    if (!due.length) return;
+    this.store.update(state => {
+      for (const { id } of due) {
+        const schedule = state.schedules[id], firedFor = schedule.nextAt, late = now - firedFor;
+        const msg = { ...schedule.origin, messageId: `schedule:${id}:${firedFor}` };
+        // A recurring occurrence missed by more than an hour (bot offline) is skipped, not replayed late.
+        const skip = schedule.cron && late > 60 * 60 * 1000;
+        if (skip) this.log.warn?.(`定时 ${id} 错过 ${formatLocal(firedFor, now)}，已跳过`);
+        else if (schedule.kind === 'talk') {
+          const busy = Object.values(state.executions).some(e => e.scheduleId === id && ACTIVE.has(e.status));
+          const inboxId = digest(`${schedule.owner}:schedule:${id}:${firedFor}`);
+          if (!busy && !state.inbox[inboxId]) {
+            state.inbox[inboxId] = { id: inboxId, owner: schedule.owner, msg: { ...msg, inboxId }, status: 'queued', createdAt: now,
+              route: { action: 'talk', prompt: schedule.text, scheduleId: id } };
+          }
+        } else {
+          const lateNote = late > 2 * 60 * 1000 ? `\n（原定 ${formatLocal(firedFor, now)}，机器人当时不在线，延迟送达）` : '';
+          this.addReply(state, msg, `⏰ 提醒（${id}）：${schedule.text}${lateNote}`, `schedule:${id}:${firedFor}`, { fallbackAlert: true });
+        }
+        schedule.runs = (schedule.runs || 0) + (skip ? 0 : 1); schedule.lastRunAt = now;
+        const next = advanceSchedule(schedule, Math.max(now, firedFor));
+        if (next) schedule.nextAt = next;
+        else { schedule.enabled = false; schedule.doneAt = now; }
+      }
+    });
+  }
+  callRuntime(capability, input) {
+    const bin = this.adapter.settings('auto').bin;
+    return runBoundedCommand(bin, ['call', capability, '--input', JSON.stringify(input)], { env: this.adapter.env, timeoutMs: 60000 })
+      .then(response => {
+        let envelope; try { envelope = JSON.parse(response.stdout); } catch { throw new Error(`${capability} 返回无法解析`); }
+        if (!envelope.ok) throw new Error(`${capability}: ${envelope.error?.message || 'failed'}`);
+        return envelope.data;
+      });
+  }
+  /**
+   * Find IM tasks the runtime parked as needs-decision (verify "blocked", including
+   * ones resumed later by the scheduler) and notify the owner once per wake.
+   */
+  async checkDecisions() {
+    if (this.checkingDecisions || !this.cfg.decisionPollMs) return;
+    const tasks = Object.values(this.store.state.tasks).filter(t => t.sessionId && !ACTIVE.has(t.status));
+    if (!tasks.length) return;
+    this.checkingDecisions = true;
+    try {
+      const listed = []; let cursor = 0;
+      for (let page = 0; page < 10 && cursor !== null; page++) {
+        const data = await this.runtimeCall('task.list', { status: 'needs-decision', limit: 100, ...(cursor ? { cursor } : {}) });
+        listed.push(...(data.tasks || [])); cursor = data.nextCursor ?? null;
+      }
+      const real = dir => { try { return fs.realpathSync(dir); } catch { return path.resolve(dir); } };
+      const bySession = new Map(listed.map(entry => [`${real(entry.target.workspace)}\0${entry.target.sessionId}`, entry]));
+      for (const task of tasks) {
+        const entry = bySession.get(`${real(task.workspace)}\0${task.sessionId}`);
+        if (!entry) continue;
+        const wakeId = entry.wakeId || 'unknown';
+        if (task.decision?.wakeId === wakeId) continue;
+        let question = '';
+        try {
+          const detail = await this.runtimeCall('task.inspect', { target: entry.target });
+          const wake = detail.task?.wake;
+          question = wake?.checkpoint?.needsHuman?.question || String(wake?.reason || '').replace(/^\[待决策\]\s*/, '');
+        } catch (error) { this.log.warn?.(`读取待决策问题失败：${error.message}`); }
+        this.store.update(state => {
+          const current = state.tasks[task.id];
+          if (!current || current.decision?.wakeId === wakeId || ACTIVE.has(current.status)) return;
+          current.decision = { wakeId, question, notifiedAt: this.now() }; current.status = 'needs-decision';
+          const origin = this.originFor(state, current);
+          if (!origin) return;
+          this.addReply(state, origin, `【待决策 ${current.id}】${current.goal.slice(0, 80)}\n问题：${question || '任务需要你决定下一步（详情可在 /tasks 中 inspect）'}\n\n直接引用这条消息回复你的决定；或单独发送：决定 ${current.id} 你的决定`, `decision:${current.id}:${wakeId}`, { fallbackAlert: true });
+        });
+      }
+    } catch (error) { this.log.warn?.(`待决策检查失败：${error.message}`); }
+    finally { this.checkingDecisions = false; this.nextDecisionCheck = this.now() + this.cfg.decisionPollMs; }
+  }
+  /**
+   * Retention: finished records older than `retentionDays` are removed with their
+   * execution/attachment/outbox-file directories and closed chat/ops contexts.
+   * Pending, running, unknown and active items are never touched.
+   */
+  prune({ dryRun = false } = {}) {
+    const days = Number(this.cfg.retentionDays);
+    if (!(days > 0)) return null;
+    const cutoff = this.now() - days * DAY, state = this.store.state;
+    const counts = { inbox: 0, outbox: 0, executions: 0, modeSessions: 0, schedules: 0, files: 0 };
+    const executions = Object.values(state.executions).filter(e => ['succeeded', 'failed', 'cancelled', 'recovered'].includes(e.status) && (e.completedAt || e.createdAt) < cutoff);
+    const executionIds = new Set(executions.map(e => e.id));
+    const referenced = new Set(Object.values(state.executions).filter(e => !executionIds.has(e.id)).map(e => e.inboxId));
+    const inbox = Object.values(state.inbox).filter(i => i.status === 'done' && i.createdAt < cutoff && !referenced.has(i.id));
+    const outbox = Object.values(state.outbox).filter(o => ['sent', 'failed'].includes(o.status) && (o.sentAt || o.createdAt) < cutoff);
+    const current = new Set(Object.values(state.modes).map(m => m.sessionId));
+    const queuedSessions = new Set(Object.values(state.inbox).filter(i => i.status !== 'done').map(i => i.route?.modeSessionId));
+    const sessions = Object.entries(state.modeSessions).filter(([id, m]) => !current.has(id) && !queuedSessions.has(id) && (m.closedAt || m.createdAt) < cutoff);
+    const schedules = Object.values(state.schedules || {}).filter(s => !s.enabled && (s.doneAt || s.cancelledAt || s.createdAt) < cutoff);
+    counts.executions = executions.length; counts.inbox = inbox.length; counts.outbox = outbox.length;
+    counts.modeSessions = sessions.length; counts.schedules = schedules.length;
+    if (dryRun) return counts;
+    const remove = target => { try { if (fs.existsSync(target)) { fs.rmSync(target, { recursive: true, force: true }); counts.files++; } } catch (error) { this.log.warn?.(`清理失败 ${target}: ${error.message}`); } };
+    const talkFiles = [], opsDirs = [];
+    this.store.update(next => {
+      for (const e of executions) delete next.executions[e.id];
+      for (const i of inbox) delete next.inbox[i.id];
+      for (const o of outbox) delete next.outbox[o.id];
+      for (const s of schedules) {
+        delete next.schedules[s.id];
+        const conversation = next.conversations[`schedule:${s.id}`];
+        if (conversation) { talkFiles.push(path.join(this.root, 'talk', digest(s.owner).slice(0, 24), `${conversation.id}.json`)); delete next.conversations[`schedule:${s.id}`]; }
+      }
+      for (const [id, session] of sessions) {
+        delete next.modeSessions[id];
+        const conversation = next.conversations[id];
+        if (conversation) { talkFiles.push(path.join(this.root, 'talk', digest(session.owner).slice(0, 24), `${conversation.id}.json`)); delete next.conversations[id]; }
+        if (session.kind === 'tasks') opsDirs.push(path.join(this.adapter.env?.META_AGENT_TASKS_OPS_ROOT || path.join(this.root, 'task-ops'), digest(session.owner).slice(0, 24), id));
+      }
+      for (const [owner, pending] of Object.entries(next.pendingMedia || {})) if (this.now() - pending.at > 600000) delete next.pendingMedia[owner];
+      for (const task of Object.values(next.tasks)) {
+        if (task.result?.text?.length > 4000 && !ACTIVE.has(task.status) && executionIds.has(task.executionId)) task.result.text = `${task.result.text.slice(0, 4000)}…（已截断）`;
+      }
+      next.lastPruneAt = this.now();
+    });
+    for (const e of executions) { remove(this.directory(e.id)); remove(path.join(this.root, 'outbox-files', e.id)); }
+    for (const i of inbox) remove(path.join(this.root, 'attachments', i.id));
+    for (const file of [...talkFiles, ...opsDirs]) remove(file);
+    if (Object.values(counts).some(Boolean)) this.log.info?.(`已清理 ${days} 天前的记录`, counts);
+    return counts;
   }
   async tick() {
     if (this.ticking || this.stopped) return;
     this.ticking = true;
-    try { await this.processInbox(); await this.monitorAndLaunch(); }
+    try {
+      this.runSchedules();
+      await this.processInbox(); await this.monitorAndLaunch();
+      if (this.cfg.retentionDays > 0 && this.now() - (this.store.state.lastPruneAt || 0) > DAY) this.prune();
+      if (this.cfg.decisionPollMs && this.now() >= this.nextDecisionCheck) void this.checkDecisions();
+    }
     finally { this.ticking = false; }
   }
   start() {
@@ -406,7 +725,7 @@ export class PersonalAgent {
   async close() {
     this.stopped = true; clearInterval(this.timer); clearInterval(this.sendTimer);
     // Detached runtime supervisors intentionally survive this channel shutdown.
-    while (this.ticking || this.sending || this.processing.size) await new Promise(resolve => setTimeout(resolve, 25));
+    while (this.ticking || this.sending || this.processing.size || this.checkingDecisions) await new Promise(resolve => setTimeout(resolve, 25));
     this.store.close();
   }
 }

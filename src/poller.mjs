@@ -17,7 +17,7 @@ import { log, sleep, redactUrl } from "./util.mjs";
 export async function startPolling(opts) {
   const {
     baseUrl, token, accountId, initialGetUpdatesBuf, loadSyncBuf, saveSyncBuf,
-    onMessage, onError, abortSignal, routeTag, ackAfterHandle = false,
+    onMessage, onError, onHealthy, abortSignal, routeTag, ackAfterHandle = false,
     longPollTimeoutMs = DEFAULT_LONG_POLL_TIMEOUT_MS,
     shouldPause = isSessionPaused, reloadCredentials,
     getUpdatesFn = getUpdates, sleepFn = sleep,
@@ -32,6 +32,8 @@ export async function startPolling(opts) {
   let nextTimeoutMs = longPollTimeoutMs;
   let consecutiveFailures = 0;
   let wasPaused = false;
+  // Set on the first failure (network or stale token); cleared by the next good poll.
+  let unhealthySince = null;
 
   const reportError = async (err) => {
     try { await onError?.(err); } catch { aLog("warn", "onError callback threw"); }
@@ -92,6 +94,10 @@ export async function startPolling(opts) {
         nextTimeoutMs = resp.longpolling_timeout_ms;
       }
       consecutiveFailures = 0;
+      if (unhealthySince !== null) {
+        const since = unhealthySince; unhealthySince = null;
+        try { await onHealthy?.({ accountId, since, downMs: Date.now() - since }); } catch { aLog("warn", "onHealthy callback threw"); }
+      }
       const commitCursor = async () => {
         if (typeof resp.get_updates_buf === "string" && resp.get_updates_buf !== "") {
           await saveSyncBuf?.(resp.get_updates_buf);
@@ -118,6 +124,7 @@ export async function startPolling(opts) {
       }
     } catch (err) {
       if (abortSignal?.aborted) break;
+      unhealthySince ??= Date.now();
       if (err?.isSessionExpired || err?.isStaleToken || err?.errcode === SESSION_EXPIRED_ERRCODE || err?.ret === SESSION_EXPIRED_ERRCODE) {
         pauseSession(accountId);
         wasPaused = true;

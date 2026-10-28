@@ -90,7 +90,7 @@ export function parseHumanValue(field, text) {
 export function createHumanTasks({ bot, stateDir, routes = [], defaultRecipient = null, api = createHumanTaskApi(), allowFrom = [],
   pollMs = 5000, now = Date.now, log = console } = {}) {
   if (defaultRecipient && (!defaultRecipient.accountId || !defaultRecipient.userId)) throw new Error('人工工单默认收件人需要 accountId 和 userId');
-  if (defaultRecipient && allowFrom.length && !allowFrom.includes(defaultRecipient.userId)) throw new Error('人工工单默认收件人不在 WEIXIN_ALLOW_FROM 白名单');
+  if (defaultRecipient && allowFrom.length && !allowFrom.includes('*') && !allowFrom.includes(defaultRecipient.userId)) throw new Error('人工工单默认收件人不在 WEIXIN_ALLOW_FROM 白名单');
   const file = path.join(stateDir, 'human-tasks.json');
   const state = readState(file, { version: 1, cursor: 0, nextAlias: 1, tasks: {}, contacts: {}, origins: {}, drafts: {}, active: {}, replies: {} });
   if (state.version !== 1) throw new Error('不支持的人工工单状态版本');
@@ -98,7 +98,7 @@ export function createHumanTasks({ bot, stateDir, routes = [], defaultRecipient 
   let tail = Promise.resolve(), timer, stopped = false, lastScan = 0, lockPath;
   const persist = () => writeJson(file, state);
   const serial = fn => { const next = tail.then(fn); tail = next.catch(() => {}); return next; };
-  const allowed = userId => !allowFrom.length || allowFrom.includes(userId);
+  const allowed = userId => !allowFrom.length || allowFrom.includes('*') || allowFrom.includes(userId);
   const automatic = !defaultRecipient && !routes.length;
   // Upgrade an existing single-user installation without requiring another
   // message. Ambiguous history is left for the next eligible private message.

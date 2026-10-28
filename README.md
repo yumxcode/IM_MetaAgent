@@ -50,7 +50,17 @@ npm run agent
 
 普通聊天/工作默认读取 runtime 的 config.json；运维默认读取 glm_config.json，可分别配置 `META_AGENT_TALK_PROFILE`、`META_AGENT_CONFIG_FILE`、`META_AGENT_TASKS_PROFILE`。各执行进程固定自身配置，调用任务运维不会修改聊天进程或后续工作的模型设置。完整配置见 [.env.example](.env.example)。
 
-微信 iLink 当前以私聊为准，默认关闭群聊处理。所有命令统一检查 `WEIXIN_ALLOW_FROM`；未配置则沿用开放白名单语义。登录、媒体、引用缓存和协议说明见 [接入层手册](README-standalone.md)。
+微信 iLink 当前以私聊为准，默认关闭群聊处理。所有消息先过访问控制：设置 `WEIXIN_ALLOW_FROM` 时只放行列出的用户；**未设置时只放行“主人”**——首位私聊者自动绑定为主人（升级时若只有一个历史私聊联系人则直接沿用），其他人的消息静默拒绝并发告警。`WEIXIN_ALLOW_FROM=*` 表示不限制（不建议）。登录、媒体、引用缓存和协议说明见 [接入层手册](README-standalone.md)。
+
+## 个人助理能力
+
+- **聊天可联网**：`/talk` 中可直接问需要最新信息的问题，助理用 runtime 的 `web_search` / `web_fetch` 查找并附来源（搜索服务需在 runtime 配置，如 Tavily 或 GLM）。聊天仍没有文件和命令工具。
+- **提醒与定时**：在 `/talk` 中直接说“明天 8 点提醒我交周报”“工作日每天 9 点帮我搜一下行业新闻并总结”。提醒由机器人持久保存（`R1`、`R2`…），重启不丢；到点发送提醒（remind），或把指令当一轮聊天执行后发结果（talk）。机器人离线错过的一次性提醒会延迟补发，重复任务错过超过 1 小时的那次跳过。在 `/tasks` 中发送 `提醒` 查看、`cancel R1` 取消。时间按运行机器人的电脑本地时区。
+- **交付文件回传**：Auto 任务用 `task_journal`（kind=artifact）登记的交付文件随结果发回微信；未登记时发送本轮新生成的文档/图片类文件（pdf、docx、xlsx、pptx、csv、图片、视频、zip 等）。只发送任务工作区内的文件，默认最多 5 个、单个 25MB，超出的列出路径。
+- **待决策直接回复**：任务被 verify 判为“待决策”（runtime `needs-decision`，包括调度器唤醒后才出现的）时，机器人推送 `【待决策 A1】` 消息。在任何模式（人工回填除外）直接**引用这条消息回复**，或单独发送 `决定 A1 你的决定`，即作为 steer 交给原任务并继续执行。
+- **掉线告警**：微信登录失效（errcode -14）、轮询连续失败超过 10 分钟、陌生人尝试使用、提醒 10 分钟内无法通过微信送达时，通过备用通道告警，恢复后再通知。通道复用 meta-agent 配置中的 `notify.channels`（飞书/Lark、Slack、webhook），或设置 `IM_ALERT_WEBHOOK_URL`；`IM_ALERT_DESKTOP=true` 增加 macOS 通知。`npm run agent -- --alert-test` 发送测试告警。
+
+配置项见 [.env.example](.env.example)。
 
 ## 任务运维与项目
 
@@ -110,7 +120,11 @@ human/
 
 机器人进程重启不主动终止独立执行进程；重新连接时读取回执。执行进程已死且没有最终回执时标记 unknown，保留会话、不自动重复有副作用的工作。机器断电或服务管理器杀死整组进程后也按此方式处理；不能保证任意中断都可自动继续。
 
-微信发送成功但本地回执落盘前崩溃仍有重复投递窗口，不承诺 exactly-once。结果发送受微信 token 有效性影响。当前 JSON 存储适合单机个人使用，未提供历史自动清理。
+微信发送成功但本地回执落盘前崩溃仍有重复投递窗口，不承诺 exactly-once。结果发送受微信 token 有效性影响（会话 token 由你最近一条消息刷新；长时间不发消息后，提醒和结果可能要等你再发一条消息才能送达，提醒在此情况下会同时走告警通道）。当前 JSON 存储适合单机个人使用。
+
+**数据保留**：每天自动清理 `IM_RETENTION_DAYS`（默认 30）天前已完成的收件、发件、执行记录及其执行目录、附件副本、交付文件快照，以及已关闭的聊天/运维上下文。运行中、排队、unknown、待发送的数据和工作任务记录本身不清理。`npm run agent -- --prune --dry-run` 预览。
+
+**日志**：经 `deploy/start.sh` 启动时应用日志写入 `logs/im-metaagent.log`，按 10MB 轮转保留 5 份；相同的 warn/error 在 5 分钟窗口内只写一次并汇报重复次数。服务管理器的 `.out.log` / `.err.log` 只承接启动信息和崩溃堆栈，超过 20MB 时启动脚本保留末尾 1MB。
 
 ## 开发验证
 

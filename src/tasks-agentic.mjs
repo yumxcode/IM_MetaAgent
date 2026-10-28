@@ -13,6 +13,7 @@ im：查看微信创建的工作任务
 inspect A1：查看微信任务
 cancel A1：取消微信任务当前执行
 project list：管理微信项目
+提醒：查看提醒和定时任务；cancel R1：取消提醒
 单独发送 tasks/ 关闭本段上下文，再次进入为新上下文；单段最长有效 24 小时。`;
 
 function clip(value, max = 600) {

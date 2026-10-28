@@ -132,6 +132,17 @@ export async function loadOpsRuntime(runtimeDir) {
   return loaded;
 }
 
+/**
+ * The runtime's public main entry (package export "."), used for optional
+ * tool factories that the IM contract does not re-export (web_search / web_fetch).
+ */
+export async function loadRuntimeMain(runtimeDir) {
+  const manifest = JSON.parse(await readFile(join(runtimeDir, 'package.json'), 'utf8'));
+  const entry = manifest.exports?.['.']?.import ?? manifest.main;
+  if (typeof entry !== 'string' || entry.split('/').includes('..')) throw new Error('runtime 缺少公开主入口');
+  return import(pathToFileURL(join(runtimeDir, entry)).href);
+}
+
 /** Resolve ~/.meta-agent (or META_AGENT_HOME) exactly like the runtime. */
 export function resolveMetaAgentHome(env = process.env) {
   return resolve(env.META_AGENT_HOME?.trim() || join(homedir(), '.meta-agent'));
