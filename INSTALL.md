@@ -1,10 +1,12 @@
+> 1.4.1 升级说明：需要 meta-agent ≥ 0.13.3（simple_auto 使用独立的 `~/.meta-agent/mcp.simple_auto.json` 与 `~/.meta-agent/skills/simple_auto/`）。升级 meta-agent 后在 IM 目录运行一次 `npm run agent:setup-simple-auto`，再重启服务。
+
 > 1.4.0 升级说明：`/talk` 改为通过 meta-agent CLI 的 `simple_auto` 模式运行（IM 不再在进程内创建 runtime），自动获得 runtime 的工具、搜索服务和 `~/.meta-agent/mcp.json` 中的 MCP 服务；每段聊天有独立工作区和会话，旧版聊天历史不迁移。`/auto`、`/talk` 默认使用 meta-agent 自身的轮数/预算，旧的 `META_AGENT_MAX_TURNS` / `META_AGENT_MAX_BUDGET_USD` 被忽略，需要限制时改用 `META_AGENT_AUTO_*` / `META_AGENT_TALK_*`（见 `.env.example`）。`/tasks` 运维控制台仍使用 runtime 的公开 `@meta-agent/runtime/im` 接口。
 
 > 1.3.0 升级说明：未设置 `WEIXIN_ALLOW_FROM` 时改为**仅主人可用**（首位私聊者绑定；已有唯一私聊联系人直接沿用；有多个历史联系人时拒绝所有消息，需设置白名单或 `npm run agent -- --bind-owner <ID>`）。新增掉线告警、日志轮转、聊天联网与提醒、交付文件回传、待决策回复和 30 天数据清理，配置见 `.env.example`；`deploy/start.sh` 有改动，更新后重启服务即可，无需重装。
 
 > 1.2.0 升级要求：先构建含 `@meta-agent/runtime/im` 契约 v1 的 runtime。设置 `META_AGENT_RUNTIME_DIR=/absolute/path/to/meta_agent_runtime`，或升级独立安装并确保 CLI 与公开接口来自同一构建。微信先单独发送 `/tasks`、`/human`、`/talk` 或 `/auto` 进入模式，随后直接发内容，单独发送对应 `xxx/` 退出。旧入口不再触发，旧资料保留。详见 [P0 说明](docs/p0-personal-agent.md)。
 
-# IM_MetaAgent 1.4.0 远端安装与更新
+# IM_MetaAgent 1.4.1 远端安装与更新
 
 本发布包只包含 IM_MetaAgent：独立微信接入层、桥接入口、测试、部署脚本及腾讯官方参考代码（插件 2.4.9 / 安装器 2.1.4）。不包含 meta-agent runtime、依赖目录、本机配置、微信凭据、任务数据或日志；安装脚本不会安装或更新 runtime。
 
@@ -24,12 +26,12 @@ Node.js 20.18 及以上可安装并运行独立 IM 接入层。微信收发、�
 
 ## 首次安装
 
-将 `im-metaagent-1.4.0.tar.gz` 和 `im-metaagent-1.4.0.sha256` 上传到服务器同一目录，以运行任务的普通用户执行：
+将 `im-metaagent-1.4.1.tar.gz` 和 `im-metaagent-1.4.1.sha256` 上传到服务器同一目录，以运行任务的普通用户执行：
 
 ```bash
-sha256sum -c im-metaagent-1.4.0.sha256
-tar -xzf im-metaagent-1.4.0.tar.gz
-cd im-metaagent-1.4.0
+sha256sum -c im-metaagent-1.4.1.sha256
+tar -xzf im-metaagent-1.4.1.tar.gz
+cd im-metaagent-1.4.1
 node scripts/install-release.mjs "$HOME/apps/IM_MetaAgent" --no-service
 ```
 
@@ -67,7 +69,7 @@ sudo systemctl status im-metaagent
 本地发布包也可以全局安装；使用包内入口文件启动：
 
 ```bash
-npm install -g ./im-metaagent-1.4.0.tar.gz
+npm install -g ./im-metaagent-1.4.1.tar.gz
 IM_APP="$(npm root -g)/im-metaagent"
 mkdir -p "$HOME/im-metaagent"
 cd "$HOME/im-metaagent"
@@ -86,10 +88,10 @@ node "$IM_APP/weixin-meta-agent.mjs"
 上传新发布包及校验文件，校验、解压后从新解压目录运行同一个安装器，目标目录始终保持一致：
 
 ```bash
-# 以 1.4.0 为例；后续替换成新版本的文件名和目录名
-sha256sum -c im-metaagent-1.4.0.sha256
-tar -xzf im-metaagent-1.4.0.tar.gz
-cd im-metaagent-1.4.0
+# 以 1.4.1 为例；后续替换成新版本的文件名和目录名
+sha256sum -c im-metaagent-1.4.1.sha256
+tar -xzf im-metaagent-1.4.1.tar.gz
+cd im-metaagent-1.4.1
 node scripts/install-release.mjs "$HOME/apps/IM_MetaAgent" --service
 ```
 

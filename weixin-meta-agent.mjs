@@ -22,6 +22,14 @@ function optionalPositive(value, integer = false) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? (integer ? Math.floor(n) : n) : undefined;
 }
+/** "meta-agent v0.13.3" → compares against [major, minor, patch]. */
+export function runtimeAtLeast(versionText, wanted) {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(String(versionText || ''));
+  if (!m) return false;
+  const have = m.slice(1).map(Number);
+  for (let i = 0; i < 3; i++) if (have[i] !== wanted[i]) return have[i] > wanted[i];
+  return true;
+}
 /** Settings from 1.2 that capped every Auto run (30 turns / $10); now ignored. */
 export function deprecatedLimitKeys(env = process.env) {
   return ['META_AGENT_MAX_TURNS', 'META_AGENT_MAX_BUDGET_USD'].filter(key => env[key] !== undefined && env[key] !== '');
@@ -121,7 +129,8 @@ async function runService({ cfg, stateDir, adapter, alerts }) {
   const bot = new WeixinBot({ inboundHandler: msg => app.accept(msg) });
   const ready = await adapter.check('auto');
   if (!ready.ok) throw new Error(`meta-agent 不可用：${ready.reason || ready.code}`);
-  await adapter.check('talk'); await adapter.check('tasks');
+  const talkReady = await adapter.check('talk'); await adapter.check('tasks');
+  if (!runtimeAtLeast(talkReady.version, [0, 13, 3])) log.warn(`meta-agent ${talkReady.version || '版本未知'} 低于 0.13.3：/talk 的 MCP 与 skill 不会与其他模式隔离（仍读 mcp.json 与全局 skills），且 simple_auto 无法调用 MCP 工具。请升级 meta-agent 后运行 npm run agent:setup-simple-auto。`);
   if (!bot.listAccounts().length) throw new Error('请先运行 npm run agent:login 扫码登录');
   app = new PersonalAgent({ root: path.join(stateDir, 'personal-agent'), bot, cfg, adapter, log, alerts });
   new ConnectionMonitor({ alerts, offlineAfterMs: positive(process.env.IM_ALERT_OFFLINE_MINUTES, 10) * 60 * 1000 }).attach(bot);

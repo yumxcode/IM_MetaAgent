@@ -17,7 +17,8 @@
     "test:bridge": "npm test",
     "agent:tasks-check": "node weixin-meta-agent.mjs --tasks-check",
     "agent:human-check": "node weixin-meta-agent.mjs --human-check",
-    "release": "node scripts/package-release.mjs"
+    "release": "node scripts/package-release.mjs",
+    "agent:setup-simple-auto": "node scripts/setup-simple-auto.mjs"
   },
   "engines": {
     "node": ">=20.18"
@@ -30,5 +31,5 @@
     "qrcode-terminal": "^0.12.0",
     "silk-wasm": "^3.7.1"
   },
-  "version": "1.4.0"
+  "version": "1.4.1"
 }

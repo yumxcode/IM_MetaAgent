@@ -55,6 +55,7 @@ npm run agent
 ## 个人助理能力
 
 - **聊天即轻量执行**：`/talk` 通过 meta-agent CLI 以 `simple_auto` 模式运行，IM 不在进程内创建 runtime。每段聊天有自己的工作区（工作区监狱）和 runtime 会话，后续消息用 `--resume <会话> --new-goal` 续接，历史保留、每条消息都是当前请求。工具、联网搜索（Tavily → GLM `web-search-prime` → Anthropic）和 `~/.meta-agent/mcp.json` 中的 MCP 服务都由 runtime 提供。可直接发文件让它处理；它保存到工作区 `outbox/` 的文件会发回微信。
+- **助理的 skill 与 MCP（需 meta-agent ≥ 0.13.3）**：simple_auto 只读自己的 `~/.meta-agent/mcp.simple_auto.json` 和 `~/.meta-agent/skills/simple_auto/`，与 `/auto` 等其他模式互不可见。运行 `npm run agent:setup-simple-auto`（可先加 `-- --dry-run` 预览）会：把 `mcp.json` 里已有的服务复制过去（没有 `autoAllow` 的设为 `"readOnly"`）、补上 GLM 搜索 `web-search-prime` 和 `12306-mcp`、复制全局 skills、安装 IM 自带的 Word/Excel/PPT/PDF 办公 skill（基于 python-docx、openpyxl、python-pptx、pypdf、pdfplumber、reportlab 和 LibreOffice），并检查依赖。`mcp.json` 与全局 skills 不会被修改。
 - **轮数与预算**：`/auto` 与 `/talk` 默认使用 meta-agent 自身的上限（每次运行 1000 轮、会话累计 $300）。需要限制时设置 `META_AGENT_AUTO_MAX_TURNS` / `META_AGENT_AUTO_MAX_BUDGET_USD` / `META_AGENT_TALK_MAX_TURNS` / `META_AGENT_TALK_MAX_BUDGET_USD`；旧的 `META_AGENT_MAX_TURNS` / `META_AGENT_MAX_BUDGET_USD` 已停用。`/talk` 单条消息默认 15 分钟超时（`META_AGENT_TALK_TIMEOUT_MS`）。
 - **提醒与定时**：（聊天助理通过工作区里的 `.im/remind.mjs` 提交，机器人复核后确认）在 `/talk` 中直接说“明天 8 点提醒我交周报”“工作日每天 9 点帮我搜一下行业新闻并总结”。提醒由机器人持久保存（`R1`、`R2`…），重启不丢；到点发送提醒（remind），或把指令当一轮聊天执行后发结果（talk）。机器人离线错过的一次性提醒会延迟补发，重复任务错过超过 1 小时的那次跳过。在 `/tasks` 中发送 `提醒` 查看、`cancel R1` 取消。时间按运行机器人的电脑本地时区。
 - **交付文件回传**：Auto 任务用 `task_journal`（kind=artifact）登记的交付文件随结果发回微信；未登记时发送本轮新生成的文档/图片类文件（pdf、docx、xlsx、pptx、csv、图片、视频、zip 等）。只发送任务工作区内的文件，默认最多 5 个、单个 25MB，超出的列出路径。
