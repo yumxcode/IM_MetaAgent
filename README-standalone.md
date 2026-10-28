@@ -4,7 +4,7 @@
 
 - **`src/`（本文件所述）**：独立的纯 ESM JavaScript 接入层，可直接 `import` 使用。
 - **`weixin-meta-agent.mjs`**：微信 ↔ meta-agent 桥接，在微信上远程调用本地 meta-agent 执行任务。
-- **微信任务管理**：使用 `/tasks <自然语言>` 通过 `tasks --agentic` 运维对话查询和管理本机任务。
+- **微信任务管理**：先单独发送 `/tasks` 进入模式，再直接发送自然语言 通过 `tasks --agentic` 运维对话查询和管理本机任务。
 - **`packages/`**：腾讯官方插件代码（官方插件 2.4.9、安装器 2.1.4 的发布包参考副本，不作为 npm workspace）。
 
 
@@ -115,102 +115,11 @@ await bot.start();
 
 ### 接入本地 Agent（meta-agent 桥接）
 
-仓库自带 `weixin-meta-agent.mjs`，把**本地 meta-agent CLI**（[@meta-agent/runtime](https://github.com/yumxcode/meta_agent_runtime)）接入微信：在微信发消息 → 调用 meta-agent 执行 → 把输出以微信消息返回。
+当前个人智能体使用四种会话模式：单独发送 `/tasks`、`/human`、`/talk` 或 `/auto` 进入，直接发送内容，单独发送对应的 `tasks/`、`human/`、`talk/` 或 `auto/` 退出。未进入模式的内容仅收到提醒，不能使用其他模式的退出标记。详见 [README](README.md) 与 [P0 说明](docs/p0-personal-agent.md)。
 
-```bash
-# 1. 确保 meta-agent CLI 已全局安装且 ~/.meta-agent/config.json 配好 API key
-npm run agent:check        # 自检 CLI 可用 + 打印配置
+`src/` 的微信收发库 API 保持独立。自建业务可继续订阅 `message`；需要可靠收件时传入 `inboundHandler`，该回调必须在消息持久化后返回，失败会阻止轮询游标前移。不要在回调里等待长任务完成。`sendText` 可传固定 `clientId` 关联投递重试。
 
-# 2. 微信扫码登录（首次；复用与 login-check 相同的账号）
-npm run agent:login
-
-# 3. 开始监听
-npm run agent
-```
-
-**触发规则**（默认）：
-- **私聊**：所有文本消息触发 meta-agent
-- 原有群聊前缀策略保留作为兼容配置；腾讯官方插件当前声明支持私聊
-
-**配置**（环境变量，建议放 `.env`）：
-
-| 变量 | 默认 | 作用 |
-|---|---|---|
-| `META_AGENT_MODE` | `simple_auto` | 普通对话默认模式；`/goal <目标>` 使用完整 `auto` 自主模式 |
-| `META_AGENT_MAX_TURNS` | `30` | 最大 agentic 轮数 |
-| `META_AGENT_TIMEOUT_MS` | `0` | 单任务超时（毫秒），`0` 表示不限 |
-| `META_AGENT_MAX_CONCURRENT` | `2` | 同时处理的微信 Agent 请求数 |
-| `WEIXIN_TRIGGER_PREFIX` | `/` | 群聊触发前缀 |
-| `WEIXIN_GROUP_TRIGGER` | `prefix` | 群聊策略：`off`/`prefix`/`all` |
-| `WEIXIN_ALLOW_FROM` | (空) | 白名单 fromUserId，逗号分隔；留空=不限 |
-
-使用 `/p new <名称>`、`/p clone <url> [名称]` 建立项目，用 `/p <名称>` 切换；每个项目有独立 workspace 和会话，无项目时自动创建临时项目。`/clear` 清除当前会话。
-
-> **安全**：meta-agent 在 workspace 内可读写文件、执行 shell。确认项目目录中的文件允许 Agent 操作，并配置 `WEIXIN_ALLOW_FROM` 白名单；任务管理命令也遵循此白名单。
-
-**实现原理**：spawn `meta-agent --json --yes "<prompt>"`，逐行解析 stdout 的 JSONL 事件流，累积 `text` 事件、捕获终止 `result` 事件，返回最终输出。核心封装在 `src/meta-agent-bridge.mjs`，可独立使用：
-
-```javascript
-import { runMetaAgent, checkMetaAgent } from "./src/meta-agent-bridge.mjs";
-
-const r = await runMetaAgent("分析当前目录结构", {
-  workspace: "/tmp/agent-workspace",
-  mode: "agentic",
-  maxTurns: 20,
-  timeoutMs: 180_000,
-  onText: (delta) => process.stdout.write(delta),  // 流式增量
-});
-// r = { ok, text, isError, subtype, durationMs, numTurns, costUsd, sessionId, ... }
-console.log(r.ok ? r.text : `失败: ${r.subtype}`);
-```
-
-### 微信任务管理（tasks --agentic）
-
-`/tasks <自然语言>` 桥接 runtime 的 `tasks --agentic` 运维控制台：一个运维模型带着任务快照和 ops 工具（list / inspect / run / steer 等）处理你的消息，支持多轮追问。它能查看从终端发起的任务，也能操作微信托管的任务，与 `/p` 项目池和普通对话会话分别管理。
-
-任务后端需要 meta-agent runtime **≥ 0.11.3**。先运行 `npm run agent:tasks-check`，或 `node weixin-meta-agent.mjs --tasks-check`，只读检查后端版本与任务查询；此检查无需微信连接，也不调用模型。
-
-#### 用法
-
-```text
-/tasks                          查看当前任务概览
-/tasks 运行中的任务有哪些
-/tasks 看下第 1 个任务的详情和最近日志
-/tasks 让它立即跑一轮
-/tasks 给它追加指令：先跑测试再提交
-/tasks 上次运行的结果怎么样了
-```
-
-每轮回答前自动注入最新任务快照（带 T1/T2… 短别名，可直接说"让 T3 跑一轮"），任务用完整 session ID 定位。运行（`ops.task.run`）与纠偏（`ops.task.steer`）直接执行；**终止、删除、取消、Studio 生命周期**等高危操作默认不在微信侧授权，回复会指引到终端 `meta-agent-glm tasks --agentic` 确认执行（`META_AGENT_TASKS_ALLOW_STUDIO_CONTROL=true` 可放开 Studio 控制）。
-
-私聊可直接发“查看任务”“任务列表”“运行中的项目”“运行中的任务”“最近进展 [任务]”或“查看进展 <任务>”。当前官方通道在私聊使用这些命令；原有群聊自然语言路由策略继续保留用于兼容。所有入口都先验证白名单；查询不占普通 Agent 请求的并发额度，自己的 Agent 正在运行时仍能查询。
-
-托管执行器复用 runtime 的 TaskManager（显式准入：不会自动执行到期任务，只响应"让它跑一轮"这类请求），通过独立后台工作进程执行；工作进程读取自己的 provider 配置，不转发控制器密钥。单条消息默认最长 5 分钟（`META_AGENT_TASKS_TURN_TIMEOUT_MS`），超时中断并保存进度。
-
-**运维会话存储时间**：运维对话固定 **24 小时**有效（runtime 硬编码）。过期后历史自动清空并新建会话，微信首次回复会提示已续接/已新建/已过期重建及到期时间；写操作回执持久保留。微信侧会话与终端控制台隔离存储（默认 `~/.meta-agent/task-ops/weixin`），互不抢占。
-
-#### 后端配置
-
-以下变量均为可选项，建议放 `.env`：
-
-| 变量 | 默认 | 作用 |
-|---|---|---|
-| `META_AGENT_TASKS_BIN` | `meta-agent-glm` | 后端命令或可执行文件路径 |
-| `META_AGENT_TASKS_PROFILE` | `~/.meta-agent/glm_config.json` | 运维会话的模型配置（同时决定会话 scope） |
-| `META_AGENT_TASKS_WORKSPACES` | 全部 | 逗号分隔的绝对路径，限定控制台可见工作区 |
-| `META_AGENT_TASKS_MAX_TURNS` | `30` | 单轮运维对话的最大模型轮数 |
-| `META_AGENT_TASKS_MAX_BUDGET_USD` | `10` | 运维会话累计费用上限（24 小时内） |
-| `META_AGENT_TASKS_TURN_TIMEOUT_MS` | `300000` | 单条消息超时（毫秒），`0` 不限 |
-| `META_AGENT_TASKS_MAX_RUNNING` | `3` | 托管执行器并发上限（1–64） |
-| `META_AGENT_TASKS_OPS_ROOT` | `~/.meta-agent/task-ops/weixin` | 运维会话存储根目录 |
-| `META_AGENT_TASKS_ALLOW_STUDIO_CONTROL` | `false` | 允许微信侧执行 Studio 生命周期操作 |
-| `META_AGENT_TASKS_RUNTIME_DIR` | 自动发现 | 已安装的 runtime 根目录，用于加载运维能力 |
-
-此配置只影响 `/tasks`，普通微信对话仍使用原来的 `meta-agent` CLI 和项目会话。
-
-#### 与终端 tasks --agentic 的对应关系
-
-两者共用 TaskControlService、ops 工具和操作回执；微信侧是"每条消息一轮"的对话形态，终端是交互式 REPL（另有 `r T2` / `s T1 <纠偏>` 快捷指令）。微信侧不提供终端的高危操作确认（kill / rm / cancel / Studio 生命周期请在终端执行）。
+`runMetaAgent` 支持显式 `intent: new | continue | steer | new_goal`；非 new 必须传 resumeSessionId，新任务不能传旧会话。支持 AbortSignal、JSONL 尾行和有界输出；临时网络/模型错误不会清空个人智能体的会话关联。
 
 ### 按消息类型分别处理
 

@@ -17,7 +17,7 @@ import { log, sleep, redactUrl } from "./util.mjs";
 export async function startPolling(opts) {
   const {
     baseUrl, token, accountId, initialGetUpdatesBuf, loadSyncBuf, saveSyncBuf,
-    onMessage, onError, abortSignal, routeTag,
+    onMessage, onError, abortSignal, routeTag, ackAfterHandle = false,
     longPollTimeoutMs = DEFAULT_LONG_POLL_TIMEOUT_MS,
     shouldPause = isSessionPaused, reloadCredentials,
     getUpdatesFn = getUpdates, sleepFn = sleep,
@@ -92,16 +92,24 @@ export async function startPolling(opts) {
         nextTimeoutMs = resp.longpolling_timeout_ms;
       }
       consecutiveFailures = 0;
-      if (typeof resp.get_updates_buf === "string" && resp.get_updates_buf !== "") {
-        getUpdatesBuf = resp.get_updates_buf;
-        await saveSyncBuf?.(getUpdatesBuf);
-      }
+      const commitCursor = async () => {
+        if (typeof resp.get_updates_buf === "string" && resp.get_updates_buf !== "") {
+          await saveSyncBuf?.(resp.get_updates_buf);
+          getUpdatesBuf = resp.get_updates_buf;
+        }
+      };
+      if (!ackAfterHandle) await commitCursor();
       const msgs = Array.isArray(resp.msgs) ? resp.msgs : [];
+      let processed = 0;
       for (const msg of msgs) {
         if (abortSignal?.aborted) break;
-        try { await onMessage?.(msg, accountId); }
-        catch { aLog("error", "onMessage handler threw", { from: msg.from_user_id }); }
+        try { await onMessage?.(msg, accountId); processed++; }
+        catch (error) {
+          if (ackAfterHandle) throw error;
+          aLog("error", "onMessage handler threw", { from: msg.from_user_id });
+        }
       }
+      if (ackAfterHandle && processed === msgs.length) await commitCursor();
       // Empty polls should normally be held by the server. Defend against an
       // immediate empty response (or zero-duration test timeout) causing a spin.
       if (msgs.length === 0 && !abortSignal?.aborted) {

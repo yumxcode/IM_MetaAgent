@@ -24,6 +24,10 @@
     <key>WorkingDirectory</key>
     <string>__PROJECT_DIR__</string>
 
+    <!-- 已提交的任务由独立 supervisor 托管，不随消息接入进程重启。 -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
     <!-- 登录后自动启动 -->
     <key>RunAtLoad</key>
     <true/>

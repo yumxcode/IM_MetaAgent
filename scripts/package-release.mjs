@@ -23,7 +23,7 @@ try {
     const bytes = await fs.readFile(target);
     files.push({ path: relative, bytes: bytes.length, sha256: sha256(bytes) });
   }
-  const manifest = { format: 1, name: 'im-metaagent', version: pkg.version, createdAt: new Date().toISOString(), node: pkg.engines.node, iLinkVersion: '2.4.9', requiredRuntime: '>=0.11.3', runtimeIncluded: false, files };
+  const manifest = { format: 1, name: 'im-metaagent', version: pkg.version, createdAt: new Date().toISOString(), node: pkg.engines.node, iLinkVersion: '2.4.9', requiredRuntime: '>=0.13.0 with @meta-agent/runtime/im contract 1', runtimeIncluded: false, files };
   await fs.writeFile(path.join(destination, 'release-manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
   await verifyRelease(destination);
   const archive = path.join(output, archiveName);

@@ -106,10 +106,10 @@ function textItem(text) {
  * @returns {Promise<{messageId:string}>} messageId（即 client_id）
  */
 export async function sendText(opts = {}) {
-  const { baseUrl, token, to, text, contextToken, timeoutMs, routeTag, runId, signal, onSent } = opts;
+  const { baseUrl, token, to, text, contextToken, timeoutMs, routeTag, runId, signal, onSent, clientId } = opts;
   if (!contextToken) log.warn("sendText: no contextToken", { to });
   const plain = markdownToPlainText(text);
-  const req = buildMessageReq({ to, itemList: plain ? [textItem(plain)] : [], contextToken, runId });
+  const req = buildMessageReq({ to, itemList: plain ? [textItem(plain)] : [], contextToken, runId, clientId });
   const resp = await sendMessageApi({ baseUrl, token, msg: req.msg, timeoutMs, routeTag, signal });
   const result = { messageId: req.msg.client_id, serverMessageId: resp?.message_id };
   await onSent?.({ ...result, body: plain });

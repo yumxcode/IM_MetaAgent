@@ -41,18 +41,21 @@ async function nativeFixture(t, version = '0.11.3') {
   for (const relative of ['dist/core/auto', 'dist/tools/task_ops', 'dist/modes', 'dist/cli/tui']) {
     await mkdir(join(root, relative), { recursive: true });
   }
-  await writeFile(join(root, 'package.json'), JSON.stringify({ name: '@meta-agent/runtime', version, type: 'module' }));
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: '@meta-agent/runtime', version, type: 'module', exports: { './im': { import: './dist/im.js' } } }));
   const entryPath = join(root, 'dist/cli-glm.mjs');
   await writeFile(entryPath, '#!/usr/bin/env node\n');
   await chmod(entryPath, 0o755);
   const bin = join(directory, 'meta-agent-glm');
   await symlink(entryPath, bin);
   const module = (name, body) => writeFile(join(root, 'dist', name), body);
-  await module('core/auto/TasksAgenticSessionStore.js', 'export class TasksAgenticSessionStore {}');
-  await module('core/auto/TaskControlService.js', 'export class TaskControlService {}');
-  await module('tools/task_ops/index.js', 'export function createTaskOpsTools(){return []}');
-  await module('modes/AgenticSession.js', 'export class AgenticSession {}');
-  await module('cli/tui/TaskManager.js', 'export class TaskManager {}\nexport function createSubprocessManagedWorkerLauncher(){return {}}');
+  await module('im.js', `export const IM_RUNTIME_CONTRACT_VERSION = 1;
+    export class TasksAgenticSessionStore {}
+export class TaskControlService {}
+    export function createTaskOpsTools(){return []}
+export class AgenticSession {}
+    export class TaskManager {}
+export function createSubprocessManagedWorkerLauncher(){return {}}
+export function makeImageBlockFromFile(){return {}}`);
   return { root, bin, entryPath };
 }
 
@@ -77,6 +80,6 @@ test('native runtime discovery rejects outdated packages and missing executables
 
 test('loadOpsRuntime fails loudly when the runtime misses an ops export', async t => {
   const f = await nativeFixture(t);
-  await rm(join(f.root, 'dist', 'core', 'auto', 'TaskControlService.js'));
+  await writeFile(join(f.root, 'dist', 'im.js'), 'export const IM_RUNTIME_CONTRACT_VERSION = 1; export class AgenticSession {} export class TasksAgenticSessionStore {}');
   await assert.rejects(loadOpsRuntime(f.root), /TaskControlService/);
 });

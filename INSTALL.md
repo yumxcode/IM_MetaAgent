@@ -1,4 +1,6 @@
-# IM_MetaAgent 1.1.1 远端安装与更新
+> 1.2.0 升级要求：先构建含 `@meta-agent/runtime/im` 契约 v1 的 runtime。设置 `META_AGENT_RUNTIME_DIR=/absolute/path/to/meta_agent_runtime`，或升级独立安装并确保 CLI 与公开接口来自同一构建。微信先单独发送 `/tasks`、`/human`、`/talk` 或 `/auto` 进入模式，随后直接发内容，单独发送对应 `xxx/` 退出。旧入口不再触发，旧资料保留。详见 [P0 说明](docs/p0-personal-agent.md)。
+
+# IM_MetaAgent 1.1.4 远端安装与更新
 
 本发布包只包含 IM_MetaAgent：独立微信接入层、桥接入口、测试、部署脚本及腾讯官方参考代码（插件 2.4.9 / 安装器 2.1.4）。不包含 meta-agent runtime、依赖目录、本机配置、微信凭据、任务数据或日志；安装脚本不会安装或更新 runtime。
 
@@ -6,6 +8,7 @@
 
 - Linux 服务器使用 Node.js **≥ 20.18**、npm、tar；托管服务要求 systemd，安装服务时需要 sudo。
 - 服务器已单独安装并配置 meta-agent。聊天任务运维对话（tasks --agentic）要求 **runtime ≥ 0.11.3**，`meta-agent-glm` 可执行，或在 `.env` 中指定其路径和 runtime 根目录。
+- 人工工单微信通知需要支持 `human_task.*` 的 runtime（建议 ≥ 0.12.1）。在 `.env` 设置 `META_AGENT_HUMAN_ENABLED=true`，重启后私聊机器人一条消息即可自动绑定为唯一收件人，无需填写 `userId`。配置和回填方式见 [人工工单接入说明](docs/human-tasks.md)。
 - 使用与服务器任务调度器相同的系统用户、`META_AGENT_HOME` 和 GLM 配置。微信读取服务器上的任务文件；不会自动读取另一台 Mac 的 tmux 任务。
 - 同一个微信 Bot 账号保留一个消息接收实例。迁移同一账号时，在服务器启动前停止旧机器的 IM 接收服务。
 
@@ -17,12 +20,12 @@ Node.js 20.18 及以上可安装并运行独立 IM 接入层。微信收发、�
 
 ## 首次安装
 
-将 `im-metaagent-1.1.1.tar.gz` 和 `im-metaagent-1.1.1.sha256` 上传到服务器同一目录，以运行任务的普通用户执行：
+将 `im-metaagent-1.1.4.tar.gz` 和 `im-metaagent-1.1.4.sha256` 上传到服务器同一目录，以运行任务的普通用户执行：
 
 ```bash
-sha256sum -c im-metaagent-1.1.1.sha256
-tar -xzf im-metaagent-1.1.1.tar.gz
-cd im-metaagent-1.1.1
+sha256sum -c im-metaagent-1.1.4.sha256
+tar -xzf im-metaagent-1.1.4.tar.gz
+cd im-metaagent-1.1.4
 node scripts/install-release.mjs "$HOME/apps/IM_MetaAgent" --no-service
 ```
 
@@ -38,6 +41,8 @@ META_AGENT_TASKS_BIN=meta-agent-glm
 # META_AGENT_TASKS_PROFILE=/absolute/path/to/glm_config.json
 WEIXIN_ALLOW_FROM=your-weixin-user-id
 WEIXIN_REPLY_PROGRESS_MESSAGES=true
+# 开启人工工单通知；首次私聊自动绑定收件人。
+META_AGENT_HUMAN_ENABLED=true
 ```
 
 同一用户已有登录和项目状态时会继续使用原状态目录。新服务器没有这些数据，需要扫码登录并配置 runtime 的模型凭据。扫码后可通过账号信息/收到消息的发送者 ID 填写白名单。
@@ -51,14 +56,14 @@ bash deploy/install-linux.sh
 sudo systemctl status im-metaagent
 ```
 
-`agent:tasks-check` 只读，不会启动任务、不调用模型。先确认能读取与 tmux 中相同的任务，再从微信发送 `/tasks` 验证运维对话。Linux 安装脚本启用开机自启、崩溃重启，并在系统已有 logrotate 时安装日志轮转规则。
+`agent:tasks-check` 只读，不会启动任务、不调用模型。先确认能读取与 tmux 中相同的任务，再从微信先发送 `/tasks`，再发送“查看任务”验证运维对话，最后发送 `tasks/` 退出。Linux 安装脚本启用开机自启、崩溃重启，并在系统已有 logrotate 时安装日志轮转规则。
 
 ## npm 全局安装和启动
 
-本地发布包也可以全局安装；1.1.1 未新增全局命令入口，仍使用包内入口文件：
+本地发布包也可以全局安装；使用包内入口文件启动：
 
 ```bash
-npm install -g ./im-metaagent-1.1.1.tar.gz
+npm install -g ./im-metaagent-1.1.4.tar.gz
 IM_APP="$(npm root -g)/im-metaagent"
 mkdir -p "$HOME/im-metaagent"
 cd "$HOME/im-metaagent"
@@ -77,16 +82,18 @@ node "$IM_APP/weixin-meta-agent.mjs"
 上传新发布包及校验文件，校验、解压后从新解压目录运行同一个安装器，目标目录始终保持一致：
 
 ```bash
-# 以 1.1.1 为例；后续替换成新版本的文件名和目录名
-sha256sum -c im-metaagent-1.1.1.sha256
-tar -xzf im-metaagent-1.1.1.tar.gz
-cd im-metaagent-1.1.1
+# 以 1.1.4 为例；后续替换成新版本的文件名和目录名
+sha256sum -c im-metaagent-1.1.4.sha256
+tar -xzf im-metaagent-1.1.4.tar.gz
+cd im-metaagent-1.1.4
 node scripts/install-release.mjs "$HOME/apps/IM_MetaAgent" --service
 ```
 
 每次更新创建独立版本目录，先安装依赖、校验文件和检查语法，再原子切换 `current`、记录 `previous` 并重启 systemd 服务。代码或依赖检查失败时，当前版本不切换；服务安装/启动失败时会恢复上一版并尝试重启旧服务。服务的短暂存活检查不代表微信登录或远端接口健康，更新后仍需发消息验证。
 
 `shared/.env` 不会被覆盖，`shared/logs/` 不会删除。微信凭据、引用缓存、项目和会话继续留在该系统用户原有的状态目录，安装器不会读写这些数据。默认不自动清理历史版本，可在确认运行正常后自行清理不用的版本。
+
+升级后如需开启人工工单通知，在现有 `shared/.env` 添加 `META_AGENT_HUMAN_ENABLED=true` 并重启服务，再私聊机器人一条消息完成自动绑定。已有唯一私聊记录时会直接沿用；无需设置默认用户 ID。
 
 如果服务器原来是直接运行旧 Git 目录，可以将该目录作为安装目标：安装器会导入其 `.env`，保留旧文件，在目标下增加 `releases/`、`shared/`、`current`。旧日志留在原目录。首次迁移后自动回滚仅覆盖后续版本化更新；迁移前的旧代码仍保留，必要时手动切回原服务配置。使用不同目标目录时，请自行把旧 `.env` 复制到新 `shared/.env` 并修改路径。
 

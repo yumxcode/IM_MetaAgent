@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseTasksCommand } from "../src/message-trigger.mjs";
 import { parseAgentTrigger } from "../src/message-trigger.mjs";
 import { createTasksAgenticConsole } from "../src/tasks-agentic.mjs";
 
@@ -23,43 +22,35 @@ test("allowlist is checked before every privileged or ordinary route", () => {
   }
 });
 
-test("explicit /tasks routes in groups regardless of group policy and carries the free text", () => {
-  for (const groupTrigger of ["off", "prefix", "all"]) {
-    const result = parseAgentTrigger(message("/tasks 运行中的任务", { groupId: "group-a" }),
-      { ...config, groupTrigger, triggerPrefix: "!" });
-    assert.equal(result.action, "tasks");
-    assert.equal(result.prompt, "运行中的任务");
+test("four standalone entry commands enter; content uses only the active mode", () => {
+  for (const kind of ['tasks', 'human', 'talk', 'auto']) {
+    assert.deepEqual(parseAgentTrigger(message(`/${kind}`), config), { action: 'enter', mode: kind });
+    const mode = { kind, sessionId: 'context' };
+    assert.deepEqual(parseAgentTrigger(message('第一行\n第二行'), config, mode), { action: kind, prompt: '第一行\n第二行', modeSessionId: 'context' });
+    assert.deepEqual(parseAgentTrigger(message(`${kind}/`), config, mode), { action: 'exit', mode: kind });
+    assert.equal(parseAgentTrigger(message(`${kind}/`), config).action, 'invalid');
+    assert.equal(parseAgentTrigger(message(`/${kind} 内容 ${kind}/`), config, mode).action, 'invalid');
   }
-  assert.equal(parseAgentTrigger(message("/tasks", { groupId: "group-a" }), config).prompt, "");
-  assert.equal(parseAgentTrigger(message("/p list"), config).action, "project");
-  assert.equal(parseAgentTrigger(message("/goal build it"), config).action, "goal");
-  assert.equal(parseAgentTrigger(message("/clear"), config).action, "clear");
 });
 
-test("natural aliases in groups obey prefix, mention stripping, all, and off", () => {
-  const group = text => message(text, { groupId: "group-a" });
-  assert.equal(parseAgentTrigger(group("查看任务"), config).action, "ignore");
-  assert.equal(parseAgentTrigger(group("/查看任务"), config).prompt, "查看任务");
-  assert.equal(parseAgentTrigger(group("/@bot 运行中的项目"), config).prompt, "运行中的项目");
-  assert.equal(parseAgentTrigger(group("!最近进展 session-a"), { ...config, triggerPrefix: "!" }).prompt,
-    "最近进展 session-a");
-  assert.equal(parseAgentTrigger(group("最近进展"), { ...config, groupTrigger: "all" }).prompt, "最近进展");
-  assert.equal(parseAgentTrigger(group("/查看任务"), { ...config, groupTrigger: "off" }).action, "ignore");
-  assert.equal(parseAgentTrigger(group("查看进展 session-a"), { ...config, groupTrigger: "off" }).action, "ignore");
+test("switching, duplicate entry and mismatched exits never change the active mode", () => {
+  const mode = { kind: 'tasks', sessionId: 'context' };
+  for (const text of ['/tasks', '/auto', 'talk/', 'human/', 'auto/']) {
+    assert.equal(parseAgentTrigger(message(text), config, mode).action, 'invalid');
+  }
+  assert.equal(parseAgentTrigger(message('查看任务'), config).action, 'invalid');
 });
 
-test("private aliases require a complete request; partial mentions stay ordinary prompts", () => {
-  for (const text of ["查看任务", "任务列表", "所有任务", "运行中的任务", "运行中的项目",
-    "最近进展", "最近进展 session-a", "查看进展 session-a"]) {
-    const result = parseAgentTrigger(message(text), config);
-    assert.equal(result.action, "tasks", text);
-    assert.equal(result.prompt, text);
-  }
-  assert.equal(parseAgentTrigger(message("请查看任务然后写总结"), config).action, "respond");
-  assert.equal(parseTasksCommand("/tasks-other"), null);
-  assert.equal(parseTasksCommand("tasks"), null);
-  // Bare flags are now just console prompts — the old local grammar is gone.
-  assert.equal(parseTasksCommand("/tasks --manage"), "--manage");
+test("quoted commands never become the sender's command", () => {
+  assert.equal(parseAgentTrigger(message('/auto', { commandText: '' }), config).action, 'invalid');
+  assert.equal(parseAgentTrigger(message('quoted', { commandText: '自己的问题', quoteContext: '/auto' }), config,
+    { kind: 'talk', sessionId: 's' }).action, 'talk');
+});
+
+test("disabled groups stay silent; enabled groups have their own mode", () => {
+  assert.equal(parseAgentTrigger(message('/tasks', { groupId: 'g' }), { ...config, groupTrigger: 'off' }).action, 'ignore');
+  assert.equal(parseAgentTrigger(message('/tasks', { groupId: 'g' }), config).action, 'enter');
+  assert.equal(parseAgentTrigger(message('查看任务', { groupId: 'g' }), config).action, 'invalid');
 });
 
 // ---------------------------------------------------------------------------
@@ -218,7 +209,7 @@ test("a rotated expired session wipes history and the reply says so", async () =
   assert.match(reply, /上次运维会话已超过 24 小时有效期/);
 });
 
-test("the model config file is pinned to the GLM profile like meta-agent-glm", async t => {
+test("task operations never mutate the host model configuration", async t => {
   const previous = process.env.META_AGENT_CONFIG_FILE;
   delete process.env.META_AGENT_CONFIG_FILE;
   t.after(() => {
@@ -227,7 +218,7 @@ test("the model config file is pinned to the GLM profile like meta-agent-glm", a
   });
   const f = fixture();
   await f.console_.turn("查看任务");
-  assert.equal(process.env.META_AGENT_CONFIG_FILE, "/test/glm_config.json");
+  assert.equal(process.env.META_AGENT_CONFIG_FILE, undefined);
 });
 
 test("authorization auto-approves task run/steer and gates studio control", async () => {

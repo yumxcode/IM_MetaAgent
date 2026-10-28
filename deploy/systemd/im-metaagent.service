@@ -21,8 +21,9 @@ RestartSec=15
 StandardOutput=append:__LOG_OUT__
 StandardError=append:__LOG_ERR__
 
-# 优雅关闭：SIGTERM 给 node 主进程，10s 后仍未退出则 SIGKILL
-KillMode=mixed
+# 只停止消息接入进程；已提交的独立执行进程保留，重启后重新读取回执。
+# 取消具体执行请用 进入 /tasks 模式后发送 cancel A1。
+KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=10
 

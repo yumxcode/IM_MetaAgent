@@ -119,24 +119,15 @@ export async function discoverTaskRuntime({ bin = 'meta-agent-glm', runtimeDir, 
  * the managed worker launcher. Imports are deferred until the console is used.
  */
 export async function loadOpsRuntime(runtimeDir) {
-  const file = relative => pathToFileURL(join(runtimeDir, 'dist', relative)).href;
-  const [store, service, tools, session, manager] = await Promise.all([
-    import(file('core/auto/TasksAgenticSessionStore.js')),
-    import(file('core/auto/TaskControlService.js')),
-    import(file('tools/task_ops/index.js')),
-    import(file('modes/AgenticSession.js')),
-    import(file('cli/tui/TaskManager.js')),
-  ]);
-  const loaded = {
-    TasksAgenticSessionStore: store.TasksAgenticSessionStore,
-    TaskControlService: service.TaskControlService,
-    createTaskOpsTools: tools.createTaskOpsTools,
-    AgenticSession: session.AgenticSession,
-    TaskManager: manager.TaskManager,
-    createSubprocessManagedWorkerLauncher: manager.createSubprocessManagedWorkerLauncher,
-  };
-  for (const [name, value] of Object.entries(loaded)) {
-    if (typeof value !== 'function') throw new Error(`meta-agent runtime 缺少 ${name}，请升级到 >= 0.11.3。`);
+  const manifest = JSON.parse(await readFile(join(runtimeDir, 'package.json'), 'utf8'));
+  const entry = manifest.exports?.['./im']?.import;
+  if (typeof entry !== 'string' || !entry.startsWith('./') || entry.split('/').includes('..')) {
+    throw new Error('runtime 缺少公开的 @meta-agent/runtime/im 接口，请更新并构建 runtime。');
+  }
+  const loaded = await import(pathToFileURL(join(runtimeDir, entry)).href);
+  if (loaded.IM_RUNTIME_CONTRACT_VERSION !== 1) throw new Error('不支持的 runtime IM 契约版本');
+  for (const name of ['AgenticSession', 'TasksAgenticSessionStore', 'TaskControlService', 'createTaskOpsTools', 'TaskManager', 'createSubprocessManagedWorkerLauncher', 'makeImageBlockFromFile']) {
+    if (typeof loaded[name] !== 'function') throw new Error(`runtime IM 接口缺少 ${name}`);
   }
   return loaded;
 }

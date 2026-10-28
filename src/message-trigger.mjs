@@ -1,42 +1,36 @@
-/** The sender allowlist applies to every command, before any route is selected. */
-const NATURAL_TASKS = /^(查看任务|任务列表|所有任务|运行中的项目|运行中的任务|最近进展(?:\s+[\s\S]+)?|查看进展(?:\s+[\s\S]+)?)$/;
+export const MODE_NAMES = { tasks: '任务运维', human: '人工回填', talk: '聊天', auto: '工作执行' };
+export const COMMAND_HELP = `请单独发送 /tasks、/human、/talk 或 /auto 进入对应模式。
+进入后直接发送内容，无需每句话加标记。
+单独发送当前模式的 tasks/、human/、talk/ 或 auto/ 退出。
+切换模式前，请先退出当前模式。`;
 
-/**
- * Recognise explicit /tasks commands and a few complete natural-language
- * requests. Returns the console prompt string ("" for a bare /tasks), or null
- * when the text is not a task-ops request.
- */
-export function parseTasksCommand(raw, { allowNatural = false } = {}) {
-  const text = String(raw ?? "").trim();
-  const explicit = text.match(/^\/tasks(?:\s+([\s\S]*))?$/i);
-  if (explicit) return (explicit[1] ?? "").trim();
-  if (allowNatural && NATURAL_TASKS.test(text)) return text;
-  return null;
+/** Only the sender's own standalone message may enter or exit a mode. */
+export function parseModeMessage(value, current, { hasMedia = false } = {}) {
+  const raw = String(value ?? '').trim();
+  const enter = /^\/(tasks|human|talk|auto)$/i.exec(raw);
+  const exit = /^(tasks|human|talk|auto)\/$/i.exec(raw);
+  if (enter) {
+    const mode = enter[1].toLowerCase();
+    if (current) return { action: 'invalid', reason: current.kind === mode
+      ? `当前已处于${MODE_NAMES[mode]}模式，请直接发送内容；退出请单独发送 ${mode}/。`
+      : `当前处于${MODE_NAMES[current.kind]}模式，请先单独发送 ${current.kind}/ 退出，再发送 /${mode}。` };
+    return { action: 'enter', mode };
+  }
+  if (exit) {
+    const mode = exit[1].toLowerCase();
+    if (!current) return { action: 'invalid', reason: `当前未进入任何模式，不能使用 ${mode}/。` };
+    if (current.kind !== mode) return { action: 'invalid', reason: `当前处于${MODE_NAMES[current.kind]}模式，只能使用 ${current.kind}/ 退出。` };
+    return { action: 'exit', mode };
+  }
+  if (/^\/(tasks|human|talk|auto)(?=\s|$)/i.test(raw)) return { action: 'invalid', reason: '进入模式的命令必须单独发送，例如 /tasks；请勿把命令和内容放在同一条消息中。' };
+  if (!current) return { action: 'invalid', reason: '当前未进入任何模式，请先单独发送 /tasks、/human、/talk 或 /auto。' };
+  if (!raw && !hasMedia) return { action: 'invalid', reason: '请发送内容，或单独发送当前模式的退出标记。' };
+  const prompt = raw || (current.kind === 'human' ? '附件' : '请查看附件并概括其内容。');
+  return { action: current.kind, prompt, modeSessionId: current.sessionId };
 }
 
-export function parseAgentTrigger(msg, cfg) {
-  const raw = (msg.commandText ?? msg.text)?.trim();
-  const fullPrompt = msg.text?.trim() || raw;
-  if (cfg.allowFrom.length && !cfg.allowFrom.includes(msg.fromUserId)) return { action: "ignore" };
-  if (!raw) return { action: "ignore" };
-
-  // /tasks is an explicit command and works in groups regardless of group policy.
-  const direct = parseTasksCommand(raw, { allowNatural: !msg.groupId });
-  if (direct !== null) return { action: "tasks", prompt: direct };
-  if (raw === "/clear") return { action: "clear" };
-  if (raw === "/p" || raw.startsWith("/p ")) {
-    const parts = (raw === "/p" ? "" : raw.slice(3).trim()).split(/\s+/);
-    return { action: "project", subcmd: parts[0] || "", args: parts.slice(1) };
-  }
-  if (raw === "/goal" || raw.startsWith("/goal ")) return { action: "goal", prompt: raw === "/goal" ? "" : [msg.quoteContext, raw.slice(6).trim()].filter(Boolean).join("\n") };
-  if (!msg.groupId) return { action: "respond", prompt: fullPrompt };
-  if (cfg.groupTrigger === "off") return { action: "ignore" };
-  if (cfg.groupTrigger === "all") {
-    const prompt = parseTasksCommand(raw, { allowNatural: true });
-    return prompt !== null ? { action: "tasks", prompt } : { action: "respond", prompt: fullPrompt };
-  }
-  if (!raw.startsWith(cfg.triggerPrefix)) return { action: "ignore" };
-  const prompt = raw.slice(cfg.triggerPrefix.length).replace(/^@\S+\s*/, "").trim();
-  const taskPrompt = parseTasksCommand(prompt, { allowNatural: true });
-  return taskPrompt !== null ? { action: "tasks", prompt: taskPrompt } : { action: prompt ? "respond" : "ignore", prompt: [msg.quoteContext, prompt].filter(Boolean).join("\n") };
+export function parseAgentTrigger(msg, cfg = {}, current) {
+  if (cfg.allowFrom?.length && !cfg.allowFrom.includes(msg.fromUserId)) return { action: 'ignore' };
+  if (msg.groupId && cfg.groupTrigger === 'off') return { action: 'ignore' };
+  return parseModeMessage(msg.commandText ?? msg.text, current, { hasMedia: Boolean(msg.mediaPath || msg.mediaItem) });
 }

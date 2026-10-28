@@ -155,3 +155,25 @@ test("custom paused state without a guard entry sleeps instead of spinning", asy
   assert.equal(calls, 0);
   assert.deepEqual(delays, [2000]);
 });
+
+test('durable acknowledgement retries the old cursor on handler failure and commits only after persistence', async () => {
+  const controller = new AbortController(), order = [], requested = [];
+  let attempts = 0;
+  await startPolling({ baseUrl: BASE, accountId: ACCOUNT, abortSignal: controller.signal, ackAfterHandle: true,
+    loadSyncBuf: () => 'old', saveSyncBuf: cursor => order.push(`commit:${cursor}`),
+    getUpdatesFn: async options => { requested.push(options.getUpdatesBuf); return { ret: 0, get_updates_buf: 'new', msgs: [{ message_id: 'one' }, { message_id: 'two' }] }; },
+    onMessage: msg => { order.push(`persist:${msg.message_id}`); if (++attempts === 1) throw new Error('disk unavailable'); if (msg.message_id === 'two') controller.abort(); },
+    sleepFn: async () => {},
+  });
+  assert.deepEqual(requested, ['old', 'old']);
+  assert.deepEqual(order, ['persist:one', 'persist:one', 'persist:two', 'commit:new']);
+});
+
+test('aborting halfway through a durable batch does not acknowledge unseen messages', async () => {
+  const controller = new AbortController(); let commits = 0;
+  await startPolling({ baseUrl: BASE, accountId: ACCOUNT, abortSignal: controller.signal, ackAfterHandle: true,
+    saveSyncBuf: () => commits++, getUpdatesFn: async () => ({ ret: 0, get_updates_buf: 'new', msgs: [{}, {}] }),
+    onMessage: () => controller.abort(), sleepFn: async () => {},
+  });
+  assert.equal(commits, 0);
+});

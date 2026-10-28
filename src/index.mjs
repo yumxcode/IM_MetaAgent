@@ -124,6 +124,7 @@ class WeixinBot {
     this.routeTag = opts.routeTag;
     this.inboundMediaDir = opts.inboundMediaDir;
     this.autoDownloadMedia = opts.autoDownloadMedia !== false;
+    this.inboundHandler = opts.inboundHandler;
 
     this._emitter = createEmitter();
     this._typingManagers = new Map(); // accountId -> TypingTicketManager
@@ -291,6 +292,7 @@ class WeixinBot {
         loadSyncBuf: () => loadSyncBuf(accountId), saveSyncBuf: buf => saveSyncBuf(accountId, buf),
         abortSignal: controller.signal,
         reloadCredentials: () => { const fresh = this._account(accountId); return { token: fresh.token, baseUrl: fresh.baseUrl }; },
+        ackAfterHandle: Boolean(this.inboundHandler),
         onMessage: (raw, id) => this._handleInbound(raw, id),
         onError: async err => {
           await this._emitter.emit("error", err);
@@ -375,6 +377,7 @@ class WeixinBot {
       } catch (err) {
         log.error(`inbound media download failed`, { accountId, from: msg.fromUserId, err: String(err) });
         await this._emitter.emit("error", err);
+        if (this.inboundHandler) throw err;
       }
     }
 
@@ -382,6 +385,8 @@ class WeixinBot {
       try { await this._quoteStore.put({ accountId, conversationId: msg.groupId || msg.fromUserId, messageId: String(msg.messageId), direction: "inbound", body: msg.commandText, sourceMediaPath: msg.mediaPath, mediaMime: msg.mediaType, mediaName: msg.fileName }); }
       catch (err) { log.warn("inbound quote cache failed", { err: err.name }); }
     }
+    // Durable consumer failures must propagate to the poller; observers remain best effort.
+    if (this.inboundHandler) await this.inboundHandler(msg);
     // 按类型分发
     await this._emitter.emit("message", msg);
     if (msg.mediaPath) {
@@ -437,7 +442,7 @@ class WeixinBot {
    * 发送纯文本。
    * contextToken 缺省时自动从内存缓存取（基于 accountId + to）。
    */
-  async sendText({ to, text, contextToken, accountId, timeoutMs, runId, signal } = {}) {
+  async sendText({ to, text, contextToken, accountId, timeoutMs, runId, signal, clientId } = {}) {
     const acc = this._account(accountId);
     assertSessionActive(acc.accountId);
     const ctx = contextToken ?? getContextToken(acc.accountId, to);
@@ -447,7 +452,7 @@ class WeixinBot {
       to,
       text,
       contextToken: ctx,
-      timeoutMs, runId, signal, onSent: record => this._cacheSent(acc, to, record),
+      timeoutMs, runId, signal, clientId, onSent: record => this._cacheSent(acc, to, record),
       routeTag: this.routeTag,
     });
   }
