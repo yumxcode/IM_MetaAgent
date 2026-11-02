@@ -1,3 +1,5 @@
+> 1.5 起没有会话模式：所有消息交给常驻助理，大任务经确认后启动工作任务，见 [assistant.md](assistant.md)。本文描述的模式交互为 1.2–1.4 的历史设计，持久化、执行与恢复部分仍然适用。
+
 # P0：四类入口与可靠执行
 
 交互为持久会话模式：单独发送 `/tasks`、`/human`、`/talk`、`/auto` 进入，模式内直接发内容，单独发送对应 `tasks/`、`human/`、`talk/`、`auto/` 退出。未进入、退出不匹配或未退出就切换时仅提醒；引用文字不能切换模式。
@@ -29,7 +31,7 @@
 
 ## 部署
 
-Runtime 需构建公开 `/im` 子路径。`META_AGENT_RUNTIME_DIR` 指定根目录并作为默认 CLI 来源；显式 BIN 配置优先。`META_AGENT_TASKS_RUNTIME_DIR` 兼容保留。每个 detached worker 导入 runtime 前固定自己的 profile，主机器人进程不修改全局模型配置。
+Runtime 需构建公开 `/im` 子路径。所有用途使用同一个 CLI 与模型配置（`src/runtime-cli.mjs`）：`META_AGENT_CLI` 选择 `meta-agent` 或 `meta-agent-glm`，`META_AGENT_RUNTIME_DIR` 指定根目录并作为 CLI 来源，`META_AGENT_BIN` 只改变可执行文件位置，`META_AGENT_CONFIG_FILE` 覆盖配置文件。`META_AGENT_TASKS_RUNTIME_DIR` 作为旧名称兼容保留。每个 detached worker 导入 runtime 前固定自己的 profile，主机器人进程不修改全局模型配置。
 
 默认 work 并发 2，运维对话独立允许 1 个；runtime 的运维执行器仍保留自身 max-running。二者不是跨所有 runtime 调度器的全局预算或全局并发锁。
 

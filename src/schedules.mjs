@@ -42,8 +42,18 @@ function dayMatches(cron, date) {
 }
 
 /** Next local time strictly after `after` (ms) matching the cron, or null within ~366 days. */
-export function nextCronTime(exprOrCron, after) {
+export function nextCronTime(exprOrCron, after, { timeZone } = {}) {
   const cron = typeof exprOrCron === 'string' ? parseCron(exprOrCron) : exprOrCron;
+  if (timeZone) {
+    const fmt = new Intl.DateTimeFormat('en-US', { timeZone, minute: 'numeric', hour: 'numeric', hourCycle: 'h23', day: 'numeric', month: 'numeric', weekday: 'short' });
+    for (let at = Math.floor(after / 60000) * 60000 + 60000; at <= after + 367 * 86400000; at += 60000) {
+      const p = Object.fromEntries(fmt.formatToParts(at).map(x => [x.type, x.value]));
+      const dom = cron.dom.has(Number(p.day)), dow = cron.dow.has(['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(p.weekday));
+      const day = cron.domAny ? dow : cron.dowAny ? dom : dom || dow;
+      if (cron.minute.has(Number(p.minute)) && cron.hour.has(Number(p.hour)) && cron.month.has(Number(p.month)) && day) return at;
+    }
+    return null;
+  }
   const d = new Date(after); d.setSeconds(0, 0); d.setMinutes(d.getMinutes() + 1);
   const limit = after + 367 * 24 * 60 * 60 * 1000;
   while (d.getTime() <= limit) {
@@ -56,12 +66,38 @@ export function nextCronTime(exprOrCron, after) {
   return null;
 }
 
-/** Parse a one-shot time: "YYYY-MM-DD HH:mm", ISO 8601 (with offset), or "HH:mm" (next occurrence). */
-export function parseAt(text, now = Date.now()) {
+/** Wall-clock fields of `ms` in `timeZone`. */
+function zoned(ms, timeZone) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric', hourCycle: 'h23' })
+    .formatToParts(ms).map(p => [p.type, Number(p.value)]));
+  return { y: parts.year, mo: parts.month, d: parts.day, h: parts.hour, mi: parts.minute, s: parts.second };
+}
+/** The instant whose wall clock in `timeZone` reads the given fields (DST gaps resolve forward). */
+function fromZoned(y, mo, d, h, mi, s, timeZone) {
+  const target = Date.UTC(y, mo - 1, d, h, mi, s);
+  let guess = target;
+  for (let i = 0; i < 3; i++) {
+    const z = zoned(guess, timeZone);
+    const diff = target - Date.UTC(z.y, z.mo - 1, z.d, z.h, z.mi, z.s);
+    if (!diff) break;
+    guess += diff;
+  }
+  return guess;
+}
+
+/**
+ * Parse a one-shot time: "YYYY-MM-DD HH:mm", ISO 8601 (with offset), or "HH:mm"
+ * (next occurrence). Wall-clock forms use `timeZone` when given, else the process zone.
+ */
+export function parseAt(text, now = Date.now(), { timeZone } = {}) {
   const raw = String(text || '').trim();
   let m = /^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(raw);
   if (m) {
     const [y, mo, d, h, mi, s] = m.slice(1).map(v => Number(v ?? 0));
+    if (timeZone) {
+      if (mo < 1 || mo > 12 || d < 1 || d > new Date(Date.UTC(y, mo, 0)).getUTCDate() || h > 23 || mi > 59 || s > 59) throw new Error(`无效时间：${raw}`);
+      return fromZoned(y, mo, d, h, mi, s, timeZone);
+    }
     const date = new Date(y, mo - 1, d, h, mi, s);
     if (date.getFullYear() !== y || date.getMonth() !== mo - 1 || date.getDate() !== d || h > 23 || mi > 59) throw new Error(`无效时间：${raw}`);
     return date.getTime();
@@ -70,6 +106,12 @@ export function parseAt(text, now = Date.now()) {
   if (m) {
     const [h, mi] = m.slice(1).map(Number);
     if (h > 23 || mi > 59) throw new Error(`无效时间：${raw}`);
+    if (timeZone) {
+      const today = zoned(now, timeZone);
+      let at = fromZoned(today.y, today.mo, today.d, h, mi, 0, timeZone);
+      if (at <= now) { const next = zoned(now + 24 * 60 * 60 * 1000, timeZone); at = fromZoned(next.y, next.mo, next.d, h, mi, 0, timeZone); }
+      return at;
+    }
     const date = new Date(now); date.setHours(h, mi, 0, 0);
     if (date.getTime() <= now) date.setDate(date.getDate() + 1);
     return date.getTime();
@@ -89,6 +131,13 @@ export function formatLocal(ms, now = Date.now()) {
 }
 
 /** Full local timestamp with weekday and UTC offset, for model context. */
+/** formatNow for an explicit IANA zone (the owner's), independent of the process zone. */
+export function formatNowIn(timeZone, ms = Date.now()) {
+  if (!timeZone) return formatNow(ms);
+  const z = zoned(ms, timeZone), weekday = new Date(Date.UTC(z.y, z.mo - 1, z.d)).getUTCDay();
+  return `${z.y}-${pad(z.mo)}-${pad(z.d)} 周${WEEKDAYS[weekday]} ${pad(z.h)}:${pad(z.mi)}（${timeZone}）`;
+}
+
 export function formatNow(ms = Date.now()) {
   const d = new Date(ms), offset = -d.getTimezoneOffset(), sign = offset >= 0 ? '+' : '-';
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} 周${WEEKDAYS[d.getDay()]} ${pad(d.getHours())}:${pad(d.getMinutes())}（UTC${sign}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}）`;
@@ -109,7 +158,8 @@ export function describeCron(expr) {
 }
 
 export function describeSchedule(schedule, now = Date.now()) {
-  const when = schedule.cron ? `${describeCron(schedule.cron)}（下次 ${schedule.nextAt ? formatLocal(schedule.nextAt, now) : '无'}）` : formatLocal(schedule.at ?? schedule.nextAt, now);
+  const display = ms => schedule.timeZone ? new Intl.DateTimeFormat('zh-CN', { timeZone: schedule.timeZone, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(ms) + ` ${schedule.timeZone}` : formatLocal(ms, now);
+  const when = schedule.cron ? `${describeCron(schedule.cron)}（下次 ${schedule.nextAt ? display(schedule.nextAt) : '无'}）` : display(schedule.at ?? schedule.nextAt);
   const kind = schedule.kind === 'talk' ? '定时执行' : '提醒';
   return `${schedule.id ? `${schedule.id} · ` : ''}${kind} · ${when} · ${String(schedule.text).slice(0, 120)}`;
 }
@@ -118,14 +168,14 @@ export function describeSchedule(schedule, now = Date.now()) {
  * Validate a create request and compute its first fire time. Throws a
  * user-facing message on invalid input.
  */
-export function planSchedule({ text, at, cron, kind = 'remind' }, now = Date.now()) {
+export function planSchedule({ text, at, cron, kind = 'remind' }, now = Date.now(), { timeZone } = {}) {
   const body = String(text || '').trim();
   if (!body) throw new Error('需要提醒内容 text');
   if (body.length > 2000) throw new Error('内容过长（最多 2000 字）');
   if (!['remind', 'talk'].includes(kind)) throw new Error('kind 只能是 remind（到点发提醒）或 talk（到点执行一段聊天指令并发结果）');
   if (Boolean(at) === Boolean(cron)) throw new Error('at（一次性）和 cron（重复）必须二选一');
   if (at) {
-    const fireAt = parseAt(at, now);
+    const fireAt = parseAt(at, now, { timeZone });
     if (fireAt <= now + 30 * 1000) throw new Error(`时间 ${formatLocal(fireAt, now)} 已过去或太近`);
     if (fireAt > now + 366 * 24 * 60 * 60 * 1000) throw new Error('只支持一年内的提醒');
     return { kind, text: body, at: fireAt, nextAt: fireAt };

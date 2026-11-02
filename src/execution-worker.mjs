@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { atomicWrite, readState } from './durable-store.mjs';
-import { declaredPathsFromEvent, collectDeliverables, outboxFiles } from './deliverables.mjs';
+import { collectDeliverables, outboxFiles } from './deliverables.mjs';
 
 export async function runWorker(directory, { adapterFactory } = {}) {
   const job = readState(path.join(directory, 'request.json'), null);
@@ -19,6 +19,7 @@ export async function runWorker(directory, { adapterFactory } = {}) {
   // Process-local settings, before importing anything that caches model config.
   if (job.runtime.profile) process.env.META_AGENT_CONFIG_FILE = job.runtime.profile;
   if (job.runtime.runtimeDir) process.env.META_AGENT_RUNTIME_DIR = job.runtime.runtimeDir;
+  if (job.timeZone) { new Intl.DateTimeFormat('en', { timeZone: job.timeZone }).format(); process.env.TZ = job.timeZone; }
   const controller = new AbortController();
   const abort = () => controller.abort();
   process.once('SIGTERM', abort); process.once('SIGINT', abort);
@@ -58,7 +59,7 @@ export async function runWorker(directory, { adapterFactory } = {}) {
       result = await adapter.execute(job, { signal: controller.signal, onEvent(event) {
         // Persist identity and the latest progress; avoid an unbounded transcript copy.
         if (event.sessionId) atomicWrite(path.join(directory, 'session.json'), { sessionId: event.sessionId });
-        for (const file of declaredPathsFromEvent(event)) if (declared.length < 200) declared.push(file);
+        if (event.type === 'result' && Array.isArray(event.artifacts)) { declared.length = 0; declared.push(...event.artifacts.filter(p => typeof p === 'string').slice(0, 200)); }
         if (++eventCount % 10 === 0 || ['tool_use', 'result'].includes(event.type)) {
           atomicWrite(path.join(directory, 'progress.json'), { at: Date.now(), type: event.type,
             toolName: event.toolName, sessionId: event.sessionId });

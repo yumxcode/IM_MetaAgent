@@ -5,9 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { buildMetaAgentArgs, runMetaAgent } from '../src/meta-agent-bridge.mjs';
+import { buildMetaAgentArgs, runMetaAgent, metaAgentEnv, describeRunSubtype } from '../src/meta-agent-bridge.mjs';
 import { loadOpsRuntime } from '../src/meta-agent-tasks.mjs';
 import { RuntimeAdapter, readReminderRequests } from '../src/runtime-adapter.mjs';
+import { resolveRuntimeCli, RETIRED_CLI_KEYS } from '../src/runtime-cli.mjs';
+import { createHumanTaskApi } from '../src/human-task-api.mjs';
 import { atomicWrite, readState } from '../src/durable-store.mjs';
 
 function temp(t) { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'im-adapter-')); t.after(() => fs.rmSync(root, { recursive: true, force: true })); return root; }
@@ -35,13 +37,54 @@ test('timeout actually kills a child that ignores SIGTERM', async t => {
   assert.equal(result.subtype, 'timeout'); assert.equal(result.ok, false); assert.ok(Date.now() - before < 3000);
 });
 
-test('abort cancels execution and overlarge output cannot grow without bound', async t => {
+test('abort cancels execution', async t => {
   const root = temp(t), bin = script(root, `setInterval(()=>{},1000);`), controller = new AbortController();
   const pending = runMetaAgent('work', { bin, workspace: root, signal: controller.signal, killGraceMs: 100 });
   setTimeout(() => controller.abort(), 100); assert.equal((await pending).subtype, 'cancelled');
-  fs.writeFileSync(bin, '#!/usr/bin/env node\nprocess.stdout.write("x".repeat(5000));setInterval(()=>{},1000);');
-  const result = await runMetaAgent('work', { bin, workspace: root, maxOutputBytes: 100, killGraceMs: 100 });
-  assert.equal(result.subtype, 'output_limit');
+});
+
+test('a long stream is never killed for its total size (regression: A1 output_limit)', async t => {
+  // 2000 tool events of ~2.5 KB each ≈ 5 MB — more than the old 4 MiB cumulative cap.
+  const root = temp(t), bin = script(root, `const pad='y'.repeat(2500);
+for(let i=0;i<2000;i++)process.stdout.write(JSON.stringify({type:'tool_result',toolUseId:'t'+i,content:pad,isError:false,sessionId:'sid'})+'\\n');
+process.stdout.write(JSON.stringify({type:'result',isError:false,subtype:'success',result:'done',sessionId:'sid'})+'\\n');`);
+  let seen = 0;
+  const result = await runMetaAgent('work', { bin, workspace: root, onEvent: e => { if (e.type === 'tool_result') seen++; } });
+  assert.equal(result.ok, true); assert.equal(result.subtype, 'success'); assert.equal(result.text, 'done');
+  assert.equal(seen, 2000); assert.equal(result.droppedLines, undefined);
+});
+
+test('one oversized line is skipped, not fatal, whether it ends in a newline or at EOF', async t => {
+  const root = temp(t), bin = script(root, `const w=s=>process.stdout.write(s);
+w(JSON.stringify({type:'text',text:'a',sessionId:'sid'})+'\\n');
+w('{"type":"tool_result","content":"'); for(let i=0;i<20;i++) w('z'.repeat(500)); w('"}\\n');
+w(JSON.stringify({type:'result',isError:false,subtype:'success',result:'kept',sessionId:'sid'})+'\\n');`);
+  const result = await runMetaAgent('work', { bin, workspace: root, maxLineBytes: 4096 });
+  assert.equal(result.ok, true); assert.equal(result.text, 'kept'); assert.equal(result.droppedLines, 1);
+  fs.writeFileSync(bin, `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({type:'text',text:'partial',sessionId:'sid'})+'\\n');process.stdout.write('{"type":"result","result":"'+'q'.repeat(10000));`);
+  const tail = await runMetaAgent('work', { bin, workspace: root, maxLineBytes: 4096 });
+  assert.equal(tail.ok, false); assert.equal(tail.subtype, 'no_result'); assert.equal(tail.text, 'partial'); assert.equal(tail.droppedLines, 1);
+  assert.match(tail.errors.join('\n'), /跳过了 1 条/);
+});
+
+test('streamed text fallback keeps a bounded tail', async t => {
+  const root = temp(t), bin = script(root, `for(let i=0;i<300;i++)process.stdout.write(JSON.stringify({type:'text',text:String(i%10).repeat(100),sessionId:'sid'})+'\\n');`);
+  const result = await runMetaAgent('work', { bin, workspace: root, maxTextChars: 1000 });
+  assert.ok(result.text.length <= 2000); assert.ok(result.text.endsWith('9'.repeat(100)));
+});
+
+test('lean JSON events are requested through the environment and an operator value wins', async t => {
+  const root = temp(t), bin = script(root, `process.stdout.write(JSON.stringify({type:'result',isError:false,subtype:'success',result:String(process.env.META_AGENT_JSON_EVENTS),sessionId:'sid'})+'\\n');`);
+  assert.equal((await runMetaAgent('work', { bin, workspace: root, env: { PATH: process.env.PATH } })).text, 'lean');
+  assert.equal((await runMetaAgent('work', { bin, workspace: root, env: { PATH: process.env.PATH, META_AGENT_JSON_EVENTS: 'full' } })).text, 'full');
+  assert.equal(buildMetaAgentArgs('x').includes('--json-events'), false); // older runtimes reject unknown flags
+  const base = { A: '1' }; assert.notEqual(metaAgentEnv(base), base); assert.equal(base.META_AGENT_JSON_EVENTS, undefined);
+});
+
+test('run subtypes are explained in Chinese; output_limit is no longer misread as a model limit', () => {
+  assert.match(describeRunSubtype('output_limit'), /^output_limit（.*与模型输出长度无关/);
+  assert.match(describeRunSubtype('error_max_output_tokens'), /token 上限/);
+  assert.equal(describeRunSubtype('something_new'), 'something_new');
 });
 
 test('two supervisors for one request execute once and persist the result after their launcher exits', async t => {
@@ -72,7 +115,7 @@ process.stdout.write(JSON.stringify({ type: 'result', isError: false, subtype: '
   const first = await adapter.execute(job);
   assert.equal(first.ok, true); assert.equal(first.sessionId, 'chat-session');
   assert.match(first.text, /已提交：提醒 · 每天 15:00/); assert.match(first.text, /已过去/);
-  assert.deepEqual(first.scheduleOps, [{ type: 'create', kind: 'remind', text: '喝水', cron: '0 15 * * *' }]);
+  assert.deepEqual(first.scheduleOps, [{ type: 'create', kind: 'remind', text: '喝水', cron: '0 15 * * *', timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }]);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(workspace, '.im', 'reminders.json'))).map(s => s.id), ['R1']);
   await adapter.execute({ ...job, id: 'two', prompt: '继续', resumeSessionId: 'chat-session', runtime: { ...job.runtime, maxTurns: 40, maxBudgetUsd: 3 } });
   const [a, b] = fs.readFileSync(argsFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
@@ -96,9 +139,40 @@ test('reminder requests are shape-checked before reaching the bot', t => {
     { type: 'create', kind: 'talk', text: '简报', cron: '0 8 * * *' }, { type: 'cancel', id: 'R2' }, { type: 'create', kind: 'remind', text: 'x', at: 123 }]);
 });
 
-test('runtime settings remain separate for chat, work and operations', () => {
-  const adapter = new RuntimeAdapter({ env: { META_AGENT_HOME: '/private/home', META_AGENT_CONFIG_FILE: '/work.json', META_AGENT_TASKS_PROFILE: '/tasks.json', META_AGENT_TALK_PROFILE: '/talk.json' } });
-  assert.equal(adapter.settings('talk').profile, '/talk.json'); assert.equal(adapter.settings('auto').profile, '/work.json'); assert.equal(adapter.settings('tasks').profile, '/tasks.json');
+test('every route resolves to one CLI and one config; retired per-route keys are ignored', () => {
+  const kinds = ['auto', 'talk', 'tasks'];
+  const same = env => { const adapter = new RuntimeAdapter({ env }); const all = kinds.map(k => adapter.settings(k)); all.forEach(s => assert.deepEqual(s, all[0])); return all[0]; };
+  const retired = { META_AGENT_TASKS_PROFILE: '/tasks.json', META_AGENT_TALK_PROFILE: '/talk.json', META_AGENT_TASKS_BIN: '/x/meta-agent-glm', META_AGENT_HUMAN_BIN: '/y' };
+  assert.deepEqual(same({ META_AGENT_HOME: '/private/home', ...retired }), { cli: 'meta-agent', bin: 'meta-agent', profile: '/private/home/config.json', runtimeDir: undefined });
+  assert.deepEqual(same({ META_AGENT_HOME: '/h', META_AGENT_CLI: 'meta-agent-glm', META_AGENT_RUNTIME_DIR: '/rt' }), { cli: 'meta-agent-glm', bin: '/rt/dist/cli-glm.mjs', profile: '/h/glm_config.json', runtimeDir: '/rt' });
+  assert.equal(same({ META_AGENT_CLI: 'meta-agent-glm', META_AGENT_CONFIG_FILE: '/work.json', META_AGENT_BIN: '/opt/ma' }).profile, '/work.json');
+  const r = resolveRuntimeCli({ META_AGENT_HOME: '/h', ...retired });
+  assert.deepEqual(r.retired, Object.keys(retired).sort((a, b) => RETIRED_CLI_KEYS.indexOf(a) - RETIRED_CLI_KEYS.indexOf(b)));
+  assert.match(r.problems[0], /已停用并被忽略.*META_AGENT_CLI=meta-agent-glm/);
+});
+
+test('META_AGENT_CLI is validated and the old runtime-dir name still works with a hint', () => {
+  const bad = resolveRuntimeCli({ META_AGENT_HOME: '/h', META_AGENT_CLI: 'glm' });
+  assert.equal(bad.cli, 'meta-agent'); assert.match(bad.problems[0], /META_AGENT_CLI=glm 无效/);
+  assert.equal(resolveRuntimeCli({ META_AGENT_CLI: ' Meta-Agent-GLM ' }).cli, 'meta-agent-glm');
+  const legacy = resolveRuntimeCli({ META_AGENT_HOME: '/h', META_AGENT_TASKS_RUNTIME_DIR: '/old/rt' });
+  assert.equal(legacy.bin, '/old/rt/dist/cli.mjs'); assert.match(legacy.problems.join(), /改为 META_AGENT_RUNTIME_DIR/);
+  assert.equal(resolveRuntimeCli({ META_AGENT_RUNTIME_DIR: '/new', META_AGENT_TASKS_RUNTIME_DIR: '/old' }).runtimeDir, '/new');
+  assert.equal(resolveRuntimeCli({}, { platform: 'win32' }).bin, 'meta-agent.cmd');
+  assert.equal(resolveRuntimeCli({ META_AGENT_CONFIG_FILE: '~/x.json' }).profile, path.join(os.homedir(), 'x.json'));
+});
+
+test('children always receive the resolved config explicitly', async t => {
+  const root = temp(t), bin = script(root, `process.stdout.write(JSON.stringify({type:'result',isError:false,subtype:'success',result:process.env.META_AGENT_CONFIG_FILE,sessionId:'s'})+'\\n');`);
+  const adapter = new RuntimeAdapter({ env: { PATH: process.env.PATH, META_AGENT_HOME: root, META_AGENT_CLI: 'meta-agent-glm' } });
+  const talk = await adapter.execute({ id: 't', kind: 'talk', prompt: 'hi', workspace: path.join(root, 'chat'), runtime: { bin } });
+  assert.equal(talk.text, path.join(root, 'glm_config.json'));
+  const auto = await adapter.execute({ id: 'a', kind: 'auto', intent: 'new', mode: 'auto', prompt: 'go', workspace: root, runtime: { bin, profile: '/snapshot.json' } });
+  assert.equal(auto.text, '/snapshot.json');
+  let seen;
+  const human = createHumanTaskApi({ env: { META_AGENT_HOME: root, META_AGENT_CLI: 'meta-agent-glm', META_AGENT_RUNTIME_DIR: '/rt' }, run: async (file, args, opts) => { seen = { file, config: opts.env.META_AGENT_CONFIG_FILE }; return { code: 0, stdout: '{"ok":true,"data":{}}' }; } });
+  await human('human_task.list', {});
+  assert.deepEqual(seen, { file: '/rt/dist/cli-glm.mjs', config: path.join(root, 'glm_config.json') });
 });
 
 test('real runtime exposes a versioned public embedding contract', { skip: !process.env.IM_TEST_RUNTIME_DIR }, async () => {
@@ -121,8 +195,9 @@ test('continuation checks runtime ownership before launching an execution', asyn
   assert.equal((await adapter.execute({ ...job, runtime: { bin } })).text, 'resumed');
 });
 
-test('one runtime root selects both execution CLIs', () => {
+test('one runtime root selects the same CLI for every route', () => {
   const adapter = new RuntimeAdapter({ env: { META_AGENT_RUNTIME_DIR: '/local/runtime' } });
   assert.equal(adapter.settings('auto').bin, '/local/runtime/dist/cli.mjs');
-  assert.equal(adapter.settings('tasks').bin, '/local/runtime/dist/cli-glm.mjs');
+  assert.equal(adapter.settings('tasks').bin, '/local/runtime/dist/cli.mjs');
+  assert.equal(new RuntimeAdapter({ env: { META_AGENT_RUNTIME_DIR: '/local/runtime', META_AGENT_CLI: 'meta-agent-glm' } }).settings('talk').bin, '/local/runtime/dist/cli-glm.mjs');
 });

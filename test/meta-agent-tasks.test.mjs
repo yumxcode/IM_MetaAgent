@@ -23,12 +23,13 @@ test('subprocess runner enforces a byte cap and a real wall-clock timeout', asyn
   }), /timed out/);
 });
 
-test('profile resolution mirrors meta-agent-glm precedence', () => {
+test('tasks profile is the one config every route uses', () => {
   const env = { META_AGENT_HOME: '/test/home' };
-  assert.equal(resolveTasksProfile(env), '/test/home/glm_config.json');
-  assert.equal(resolveTasksProfile({ ...env, META_AGENT_TASKS_PROFILE: '/custom/glm.json' }), '/custom/glm.json');
+  assert.equal(resolveTasksProfile(env), '/test/home/config.json');
+  assert.equal(resolveTasksProfile({ ...env, META_AGENT_CLI: 'meta-agent-glm' }), '/test/home/glm_config.json');
   assert.equal(resolveTasksProfile({ ...env, META_AGENT_CONFIG_FILE: '/env/config.json' }), '/env/config.json');
-  assert.equal(resolveTasksProfile({ ...env, META_AGENT_TASKS_PROFILE: '/p.json', META_AGENT_CONFIG_FILE: '/c.json' }), '/p.json');
+  assert.equal(resolveTasksProfile({ ...env, META_AGENT_TASKS_PROFILE: '/retired.json' }), '/test/home/config.json');
+  assert.equal(resolveTasksProfile(env, { profile: '/explicit.json' }), '/explicit.json');
   assert.equal(resolveMetaAgentHome({}), join(homedir(), '.meta-agent'));
 });
 

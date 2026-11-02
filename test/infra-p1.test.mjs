@@ -138,7 +138,7 @@ test('the reminder helper validates, lists pending requests and only cancels kno
   assert.deepEqual(ops.map(op => op.type), ['create', 'cancel']); assert.equal(ops[1].id, 'R1');
 });
 
-test('deliverables stay inside the workspace; undeclared runs fall back to recent documents', t => {
+test('deliverables stay inside the workspace; undeclared runs do not implicitly deliver workspace documents', t => {
   const root = temp(t), workspace = path.join(root, 'ws'), outside = path.join(root, 'secret.pdf');
   fs.mkdirSync(path.join(workspace, 'out'), { recursive: true }); fs.mkdirSync(path.join(workspace, 'im-inputs'));
   fs.writeFileSync(path.join(workspace, 'out', 'a.pdf'), 'a'); fs.writeFileSync(outside, 's');
@@ -152,7 +152,7 @@ test('deliverables stay inside the workspace; undeclared runs fall back to recen
   const declared = collectDeliverables({ workspace, declared: ['out/a.pdf', '../secret.pdf', 'link.pdf'], since: 0 });
   assert.equal(declared.source, 'declared'); assert.deepEqual(declared.files.map(f => path.basename(f)), ['a.pdf']);
   const scanned = collectDeliverables({ workspace, declared: [], since: Date.now() - 60000 });
-  assert.equal(scanned.source, 'scan'); assert.deepEqual(scanned.files.map(f => path.relative(fs.realpathSync(workspace), fs.realpathSync(f))), ['out/a.pdf']);
+  assert.equal(scanned.source, 'none'); assert.deepEqual(scanned.files, []);
   assert.deepEqual(collectDeliverables({ workspace, declared: [], since: Date.now() + 60000 }).files, []);
 });
 
@@ -164,7 +164,7 @@ const fs = require('node:fs');
 fs.writeFileSync('report.pdf', 'pdf');
 const out = e => process.stdout.write(JSON.stringify(e) + '\\n');
 out({ type: 'tool_use', toolName: 'task_journal', toolInput: { kind: 'artifact', paths: ['report.pdf', '/etc/hosts'] }, sessionId: 's' });
-out({ type: 'result', isError: false, subtype: 'success', result: 'done', sessionId: 's' });
+out({ type: 'result', isError: false, subtype: 'success', result: 'done', sessionId: 's', artifacts: ['report.pdf', '/etc/hosts'] });
 `, { mode: 0o700 });
   const { atomicWrite, readState } = await import('../src/durable-store.mjs');
   const { runWorker } = await import('../src/execution-worker.mjs');
@@ -194,4 +194,9 @@ process.stdout.write(JSON.stringify({ type: 'result', isError: false, subtype: '
   assert.equal(result.text, 'ok');
   assert.deepEqual(result.deliverables.files.map(f => path.basename(f)), ['notes.txt']);
   assert.ok(fs.existsSync(path.join(workspace, '.im', 'remind.mjs')));
+});
+
+test('channel cron first occurrence respects selected timezone before runtime handoff', async () => {
+  const {nextCronTime}=await import('../src/schedules.mjs');
+  assert.equal(nextCronTime('0 8 * * *',Date.parse('2026-11-01T00:00:00Z'),{timeZone:'America/New_York'}),Date.parse('2026-11-01T13:00:00Z'));
 });

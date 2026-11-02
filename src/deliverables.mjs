@@ -1,11 +1,9 @@
 /**
  * Which files an Auto run produced for the user.
  *
- * Declared deliverables come from the public CLI JSONL stream (task_journal
- * kind=artifact / artifacts_register). When a run declares nothing, files of
- * document/media types modified during the run are used instead. Every path is
- * resolved inside the task workspace: a model-written path can never make the
- * bot upload ~/.ssh or anything else outside it.
+ * Runtime result manifests declare deliverables. Directory scanning is opt-in
+ * for migration tooling, never the default delivery policy. Every path must
+ * resolve to a regular file inside the task workspace.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -69,11 +67,11 @@ export function scanRecentDocuments(workspace, since, { maxDepth = 4, maxEntries
  * Final list of deliverables for one run.
  * @returns {{ files: string[], source: 'declared'|'scan'|'none' }}
  */
-export function collectDeliverables({ workspace, declared = [], since, limit = 20 }) {
+export function collectDeliverables({ workspace, declared = [], since, limit = 20, allowScan = false }) {
   const unique = new Set();
   for (const candidate of declared) { const file = containedFile(workspace, candidate); if (file) unique.add(file); }
   if (unique.size) return { files: [...unique].slice(0, limit), source: 'declared' };
-  if (!Number.isFinite(since)) return { files: [], source: 'none' };
+  if (!allowScan || !Number.isFinite(since)) return { files: [], source: 'none' };
   const scanned = scanRecentDocuments(workspace, since).slice(0, limit);
   return { files: scanned, source: scanned.length ? 'scan' : 'none' };
 }

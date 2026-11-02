@@ -1,19 +1,22 @@
 #!/usr/bin/env node
-/** Four explicit entry points, backed by durable inbox/execution/outbox state. */
+/** WeChat personal assistant: one resident chat assistant, auto work tasks, durable inbox/execution/outbox state. */
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { WeixinBot, log } from './src/index.mjs';
 import { resolveStateDir } from './src/util.mjs';
-import { RuntimeAdapter } from './src/runtime-adapter.mjs';
+import { RuntimeAdapter, ASSISTANT_SYSTEM_PROMPT } from './src/runtime-adapter.mjs';
+import { resolveRuntimeCli } from './src/runtime-cli.mjs';
+import { TalkHost, probeServe } from './src/talk-host.mjs';
+import { parseRoots, displayPath } from './src/workspaces.mjs';
 import { PersonalAgent } from './src/personal-agent.mjs';
 import { createTasksAgenticConsole, TASKS_HELP } from './src/tasks-agentic.mjs';
 import { createHumanTasks, loadHumanDefaultRecipient, loadHumanRoutes } from './src/human-tasks.mjs';
 import { COMMAND_HELP } from './src/message-trigger.mjs';
 import { installGracefulShutdown } from './src/process-guard.mjs';
 import { AlertNotifier, ConnectionMonitor } from './src/alerts.mjs';
-import { readState } from './src/durable-store.mjs';
+import { loadState } from './src/durable-store.mjs';
 
 function positive(value, fallback) { const n = Number(value); return Number.isFinite(n) && n > 0 ? n : fallback; }
 /** Positive number, or undefined when unset/invalid (the runtime default then applies). */
@@ -34,6 +37,11 @@ export function runtimeAtLeast(versionText, wanted) {
 export function deprecatedLimitKeys(env = process.env) {
   return ['META_AGENT_MAX_TURNS', 'META_AGENT_MAX_BUDGET_USD'].filter(key => env[key] !== undefined && env[key] !== '');
 }
+/** What every route runs, for --check and the startup log. */
+export function describeRuntimeCli(env = process.env) {
+  const { cli, bin, profile, runtimeDir, source, problems } = resolveRuntimeCli(env);
+  return { cli, bin, profile, ...(runtimeDir ? { runtimeDir } : {}), source, usedBy: 'auto、聊天助手、tasks 运维、人工工单', ...(problems.length ? { problems } : {}) };
+}
 /** Non-negative number where an explicit 0 disables the feature. */
 function nonNegative(value, fallback) { if (value === undefined || value === '') return fallback; const n = Number(value); return Number.isFinite(n) && n >= 0 ? n : fallback; }
 export function loadConfig(env = process.env) {
@@ -44,10 +52,25 @@ export function loadConfig(env = process.env) {
     talkMaxTurns: optionalPositive(env.META_AGENT_TALK_MAX_TURNS, true), talkMaxBudgetUsd: optionalPositive(env.META_AGENT_TALK_MAX_BUDGET_USD),
     timeoutMs: Math.max(0, Number(env.META_AGENT_TIMEOUT_MS) || 0),
     talkTimeoutMs: nonNegative(env.META_AGENT_TALK_TIMEOUT_MS, 15 * 60 * 1000),
-    retentionDays: nonNegative(env.IM_RETENTION_DAYS, 30),
+    retentionDays: nonNegative(env.IM_RETENTION_DAYS, 7),
+    // Isolated task folders hold deliverables; removing them after retention is opt-in.
+    pruneTaskWorkspaces: env.IM_PRUNE_TASK_WORKSPACES === 'true',
     decisionPollMs: nonNegative(env.META_AGENT_DECISION_POLL_MS, 120000),
     sendFiles: env.IM_SEND_FILES !== 'false', sendFilesMax: Math.floor(positive(env.IM_SEND_FILES_MAX, 5)),
-    sendFileMaxBytes: Math.floor(positive(env.IM_SEND_FILE_MAX_MB, 25) * 1024 * 1024) };
+    sendFileMaxBytes: Math.floor(positive(env.IM_SEND_FILE_MAX_MB, 25) * 1024 * 1024),
+    talkServe: env.IM_TALK_SERVE !== 'false', talkMaxConcurrent: Math.floor(positive(env.META_AGENT_TALK_MAX_CONCURRENT, 2)),
+    slowNoticeMs: nonNegative(env.IM_SLOW_NOTICE_MS, 20000), typing: env.IM_TYPING !== 'false',
+    ...(() => { const { roots, problems } = parseRoots(env.IM_WORKSPACE_ROOTS); return { workspaceRoots: roots, workspaceRootProblems: problems }; })(),
+    workspaceScanDepth: Math.min(4, Math.floor(positive(env.IM_WORKSPACE_SCAN_DEPTH, 2))) };
+}
+/** `meta-agent serve` arguments and environment for the resident assistant. */
+export function serveLaunch(cfg, adapter, root) {
+  const settings = adapter.settings('talk');
+  const hostTools = path.join(root, 'serve', 'host-tools.json');
+  const args = ['--mode', 'simple_auto', '--yes', '--session-dir', path.join(root, 'runtime-sessions'), '--host-tools', hostTools, '--system', ASSISTANT_SYSTEM_PROMPT,
+    ...(cfg.talkMaxTurns ? ['--max-turns', String(cfg.talkMaxTurns)] : []), ...(cfg.talkMaxBudgetUsd ? ['--max-budget-usd', String(cfg.talkMaxBudgetUsd)] : [])];
+  const env = { ...adapter.env, ...(settings.profile ? { META_AGENT_CONFIG_FILE: settings.profile } : {}), ...(settings.runtimeDir ? { META_AGENT_RUNTIME_DIR: settings.runtimeDir } : {}) };
+  return { bin: settings.bin, args, env, hostTools };
 }
 export function setupLogFile(env = process.env, projectDir = path.dirname(fileURLToPath(import.meta.url))) {
   const file = env.IM_LOG_FILE?.trim();
@@ -57,7 +80,7 @@ export function setupLogFile(env = process.env, projectDir = path.dirname(fileUR
 function ownerCommand(args, stateDir, cfg) {
   const root = path.join(stateDir, 'personal-agent');
   if (args.includes('--owner')) {
-    const state = readState(path.join(root, 'state.json'), {});
+    const state = loadState(root);
     const contacts = [...new Set(Object.entries(state.contacts || {}).filter(([key]) => { try { return JSON.parse(key)[2] === 'private'; } catch { return false; } }).map(([, c]) => c.userId))];
     console.log(JSON.stringify({ allowFrom: cfg.allowFrom, owner: state.owner || null, ownerAmbiguous: Boolean(state.ownerAmbiguous), privateContacts: contacts }, null, 2));
     return true;
@@ -108,7 +131,9 @@ export async function main(args = process.argv.slice(2)) {
     } finally { alerts.close(); }
   }
   if (args.includes('--check')) {
-    console.log(JSON.stringify({ execution: await adapter.check('auto'), talk: await adapter.check('talk'), tasks: await adapter.check('tasks'), cfg }, null, 2)); return;
+    const talk = await adapter.check('talk'), settings = adapter.settings('talk');
+    const serve = await probeServe(settings.bin, { env: serveLaunch(cfg, adapter, stateDir).env });
+    console.log(JSON.stringify({ runtimeCli: describeRuntimeCli(), execution: await adapter.check('auto'), talk: { ...talk, residentAssistant: serve ? '支持（meta-agent serve）' : '不支持，使用单次运行' }, tasks: await adapter.check('tasks'), cfg }, null, 2)); return;
   }
   if (args.includes('--tasks-check')) {
     const console_ = createTasksAgenticConsole();
@@ -133,8 +158,14 @@ async function runService({ cfg, stateDir, adapter, alerts }) {
   if (!runtimeAtLeast(talkReady.version, [0, 13, 3])) log.warn(`meta-agent ${talkReady.version || '版本未知'} 低于 0.13.3：/talk 的 MCP 与 skill 不会与其他模式隔离（仍读 mcp.json 与全局 skills），且 simple_auto 无法调用 MCP 工具。请升级 meta-agent 后运行 npm run agent:setup-simple-auto。`);
   if (!bot.listAccounts().length) throw new Error('请先运行 npm run agent:login 扫码登录');
   app = new PersonalAgent({ root: path.join(stateDir, 'personal-agent'), bot, cfg, adapter, log, alerts });
+  for (const problem of cfg.workspaceRootProblems || []) log.warn(`IM_WORKSPACE_ROOTS 忽略：${problem}`);
+  log.info(cfg.workspaceRoots.length ? `助理可访问的文件夹：${cfg.workspaceRoots.map(r => displayPath(r)).join('、')}` : '未设置 IM_WORKSPACE_ROOTS：工作任务只使用独立目录');
+  const talkHost = await startTalkHost(cfg, adapter, app);
   new ConnectionMonitor({ alerts, offlineAfterMs: positive(process.env.IM_ALERT_OFFLINE_MINUTES, 10) * 60 * 1000 }).attach(bot);
   log.info(`告警通道：${alerts.describe()}`);
+  const runtimeCli = resolveRuntimeCli();
+  log.info(`meta-agent：${runtimeCli.cli}（${runtimeCli.bin}），模型配置 ${runtimeCli.profile}；auto、聊天助手、tasks、人工工单统一使用`);
+  for (const problem of runtimeCli.problems) log.warn(problem);
   const deprecated = deprecatedLimitKeys();
   if (deprecated.length) log.warn(`${deprecated.join('、')} 已停用并被忽略：auto 与 talk 默认使用 meta-agent 自身的轮数/预算；如需限制，改用 META_AGENT_AUTO_MAX_TURNS / META_AGENT_AUTO_MAX_BUDGET_USD / META_AGENT_TALK_MAX_TURNS / META_AGENT_TALK_MAX_BUDGET_USD。`);
   if (!cfg.allowFrom.length) log.info(app.store.state.owner ? `仅主人可用：${app.store.state.owner.userId}` : '未设置 WEIXIN_ALLOW_FROM：首位私聊者将被绑定为主人');
@@ -145,12 +176,28 @@ async function runService({ cfg, stateDir, adapter, alerts }) {
     }
     bot.on('error', error => log.error('微信接入错误', { message: error.message }));
     bot.on('session-expired', () => log.warn('微信凭据已过期，待发送结果已保留；请重新登录。'));
-    const removeShutdown = installGracefulShutdown(bot, { close: async () => { await human?.close(); await app.close(); } });
-    console.log(`微信个人智能体已启动\n${COMMAND_HELP}\n新工作默认 auto；进入 /auto 模式后，首条发送 --sapiens 目标 可启用人工工单。`);
+    const removeShutdown = installGracefulShutdown(bot, { close: async () => { await human?.close(); await talkHost?.close(); await app.close(); } });
+    console.log(`微信个人智能体已启动（${talkHost ? '常驻助手' : '单次运行助手'}）\n${COMMAND_HELP}`);
     app.start();
     try { await bot.start(); }
     finally { removeShutdown(); }
-  } finally { await human?.close(); await app.close(); }
+  } finally { await human?.close(); await talkHost?.close(); await app.close(); }
+}
+/** Start the resident assistant when the runtime supports `serve`; otherwise chat keeps using one-shot runs. */
+async function startTalkHost(cfg, adapter, app) {
+  if (!cfg.talkServe) { log.info('IM_TALK_SERVE=false：聊天使用单次运行'); return null; }
+  const launch = serveLaunch(cfg, adapter, app.root);
+  if (!await probeServe(launch.bin, { env: launch.env })) {
+    log.warn('当前 meta-agent 不支持 serve（需要 ≥ 0.14），聊天使用单次运行；升级 runtime 后可获得常驻助手、文件夹浏览和任务确认。');
+    return null;
+  }
+  fs.mkdirSync(path.dirname(launch.hostTools), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(launch.hostTools, JSON.stringify(app.tools.specs, null, 1), { mode: 0o600 });
+  const host = new TalkHost({ bin: launch.bin, args: launch.args, env: launch.env, log, onToolCall: (name, input, meta) => app.tools.call(name, input, meta) });
+  app.setTalkHost(host);
+  // Warm up in the background; the first chat turn waits for readiness if needed.
+  host.start().catch(error => log.warn(`常驻助手暂未启动：${error.message}`));
+  return host;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   main().catch(error => { console.error(`启动失败：${error.message}`); process.exitCode = 1; });

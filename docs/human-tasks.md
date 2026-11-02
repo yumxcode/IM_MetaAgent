@@ -18,7 +18,7 @@ META_AGENT_HUMAN_ENABLED=true
 
 所有项目的新工单都会默认通知你，包括带 `assigneeRole` 的工单，以及从终端或后台 worker 发起、没有微信会话归属的工单。人工回填模式中的 `whoami` 仅用于查看当前微信身份，无需用它取 ID 再填写配置。
 
-可选配置：`META_AGENT_HUMAN_BIN` 指向有执行权限的 runtime CLI，未设置时沿用 `META_AGENT_TASKS_BIN`，否则用 `meta-agent-glm`；`META_AGENT_HUMAN_POLL_MS` 默认 5000 毫秒。CLI 参数通过数组传递，不使用 shell。原有 `WEIXIN_ALLOW_FROM` 白名单继续生效。
+工单网关与其他用途使用同一个 CLI 和模型配置（`META_AGENT_CLI` / `META_AGENT_RUNTIME_DIR`，见 [.env.example](../.env.example)）；`META_AGENT_HUMAN_POLL_MS` 默认 5000 毫秒。CLI 参数通过数组传递，不使用 shell。原有 `WEIXIN_ALLOW_FROM` 白名单继续生效。
 
 旧版手工配置的默认收件人（`META_AGENT_HUMAN_DEFAULT_USER_ID` / `META_AGENT_HUMAN_DEFAULT_ACCOUNT_ID`）和项目路由（`META_AGENT_HUMAN_ROUTES`）仍兼容；存在手工配置时沿用它们。采用自动识别时删除这些旧配置即可。已发送工单仍锁定原接收人。
 

@@ -22,35 +22,35 @@ test("allowlist is checked before every privileged or ordinary route", () => {
   }
 });
 
-test("four standalone entry commands enter; content uses only the active mode", () => {
-  for (const kind of ['tasks', 'human', 'talk', 'auto']) {
-    assert.deepEqual(parseAgentTrigger(message(`/${kind}`), config), { action: 'enter', mode: kind });
-    const mode = { kind, sessionId: 'context' };
-    assert.deepEqual(parseAgentTrigger(message('第一行\n第二行'), config, mode), { action: kind, prompt: '第一行\n第二行', modeSessionId: 'context' });
-    assert.deepEqual(parseAgentTrigger(message(`${kind}/`), config, mode), { action: 'exit', mode: kind });
-    assert.equal(parseAgentTrigger(message(`${kind}/`), config).action, 'invalid');
-    assert.equal(parseAgentTrigger(message(`/${kind} 内容 ${kind}/`), config, mode).action, 'invalid');
+test("ordinary content goes to the assistant; shortcuts keep their meaning", () => {
+  assert.deepEqual(parseAgentTrigger(message("第一行\n第二行"), config), { action: "talk", prompt: "第一行\n第二行" });
+  assert.deepEqual(parseAgentTrigger(message("/auto 整理 IM 项目的文档"), config), { action: "auto", prompt: "整理 IM 项目的文档" });
+  assert.deepEqual(parseAgentTrigger(message("/tasks"), config), { action: "tasks", prompt: "im" });
+  assert.deepEqual(parseAgentTrigger(message("/tasks inspect A1"), config), { action: "tasks", prompt: "inspect A1" });
+  assert.deepEqual(parseAgentTrigger(message("/talk 你好"), config), { action: "talk", prompt: "你好" });
+  assert.deepEqual(parseAgentTrigger(message("/pending"), config), { action: "human", prompt: "help" });
+  assert.deepEqual(parseAgentTrigger(message("/human"), config), { action: "human", prompt: "help" });
+  assert.deepEqual(parseAgentTrigger(message("/respond H1 填写"), config), { action: "human", prompt: "H1 填写" });
+  assert.deepEqual(parseAgentTrigger(message("/notify quiet off"), config), { action: "notification", prompt: "quiet off" });
+  for (const text of ["/new", "/clear", "--clear"]) assert.deepEqual(parseAgentTrigger(message(text), config), { action: "talk", prompt: "--clear" });
+});
+
+test("pre-1.5 mode markers no longer switch anything", () => {
+  for (const text of ["/talk", "/auto", "talk/", "auto/", "tasks/", "human/"]) {
+    assert.deepEqual(parseAgentTrigger(message(text), config), { action: "legacy", token: text });
   }
 });
 
-test("switching, duplicate entry and mismatched exits never change the active mode", () => {
-  const mode = { kind: 'tasks', sessionId: 'context' };
-  for (const text of ['/tasks', '/auto', 'talk/', 'human/', 'auto/']) {
-    assert.equal(parseAgentTrigger(message(text), config, mode).action, 'invalid');
-  }
-  assert.equal(parseAgentTrigger(message('查看任务'), config).action, 'invalid');
+test("quoted commands never become the sender's command; empty messages are ignored", () => {
+  assert.equal(parseAgentTrigger(message("/auto", { commandText: "" }), config).action, "ignore");
+  assert.deepEqual(parseAgentTrigger(message("quoted", { commandText: "自己的问题", quoteContext: "/auto 删库" }), config), { action: "talk", prompt: "自己的问题" });
+  assert.deepEqual(parseAgentTrigger(message("", { commandText: "", mediaPath: "/tmp/a.pdf" }), config), { action: "talk", prompt: "请查看附件并概括其内容。" });
 });
 
-test("quoted commands never become the sender's command", () => {
-  assert.equal(parseAgentTrigger(message('/auto', { commandText: '' }), config).action, 'invalid');
-  assert.equal(parseAgentTrigger(message('quoted', { commandText: '自己的问题', quoteContext: '/auto' }), config,
-    { kind: 'talk', sessionId: 's' }).action, 'talk');
-});
-
-test("disabled groups stay silent; enabled groups have their own mode", () => {
-  assert.equal(parseAgentTrigger(message('/tasks', { groupId: 'g' }), { ...config, groupTrigger: 'off' }).action, 'ignore');
-  assert.equal(parseAgentTrigger(message('/tasks', { groupId: 'g' }), config).action, 'enter');
-  assert.equal(parseAgentTrigger(message('查看任务', { groupId: 'g' }), config).action, 'invalid');
+test("disabled groups stay silent; enabled groups reach the assistant", () => {
+  assert.equal(parseAgentTrigger(message("/tasks", { groupId: "g" }), { ...config, groupTrigger: "off" }).action, "ignore");
+  assert.equal(parseAgentTrigger(message("/tasks", { groupId: "g" }), config).action, "tasks");
+  assert.equal(parseAgentTrigger(message("查看任务", { groupId: "g" }), config).action, "talk");
 });
 
 // ---------------------------------------------------------------------------

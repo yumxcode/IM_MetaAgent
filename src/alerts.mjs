@@ -13,6 +13,7 @@ import { spawn } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import { log } from './util.mjs';
 import { atomicWrite, readState } from './durable-store.mjs';
+import { resolveRuntimeCli } from './runtime-cli.mjs';
 
 const TYPES = new Set(['feishu', 'lark', 'slack', 'webhook']);
 
@@ -39,7 +40,7 @@ function guessType(url) {
 /** Candidate meta-agent config files, in the same precedence the runtime uses. */
 export function alertConfigCandidates(env = process.env) {
   const home = path.resolve(env.META_AGENT_HOME?.trim() || path.join(os.homedir(), '.meta-agent'));
-  return [env.IM_ALERT_CONFIG_FILE, env.META_AGENT_CONFIG_FILE, path.join(home, 'config.json'), path.join(home, 'glm_config.json')]
+  return [env.IM_ALERT_CONFIG_FILE, resolveRuntimeCli(env).profile, path.join(home, 'config.json'), path.join(home, 'glm_config.json')]
     .filter(Boolean).map(file => path.resolve(file));
 }
 

@@ -53,7 +53,7 @@ function fixture(t, overrides = {}) {
 
 test('gateway uses fixed arguments, only approves supported writes and checks envelope', async () => {
   const calls = [];
-  const api = createHumanTaskApi({ env: { META_AGENT_HUMAN_BIN: '/custom/runtime' }, run: async (...args) => {
+  const api = createHumanTaskApi({ env: { META_AGENT_BIN: '/custom/runtime' }, run: async (...args) => {
     calls.push(args); return { code: 0, stdout: '{"ok":true,"data":{}}' };
   } });
   await api('human_task.list', { open: true });
@@ -67,13 +67,13 @@ test('gateway uses fixed arguments, only approves supported writes and checks en
   await assert.rejects(bad('human_task.list', {}), e => e.code === 'INVALID_ARGUMENT');
 });
 
-test('sapiens and human commands respect allowlist; ordinary commands retain semantics', () => {
+test('human commands respect the allowlist; form answers are routed by the agent, not the trigger', () => {
   const cfg = { allowFrom: ['u'], groupTrigger: 'off', triggerPrefix: '/' };
   const msg = commandText => ({ commandText, fromUserId: 'u' });
-  assert.equal(parseAgentTrigger(msg('--sapiens 验证步态'), cfg, { kind: 'auto', sessionId: 's' }).action, 'auto');
-  assert.equal(parseAgentTrigger(msg('H1 填写'), cfg, { kind: 'human', sessionId: 's' }).action, 'human');
+  assert.deepEqual(parseAgentTrigger(msg('/auto --sapiens 验证步态'), cfg), { action: 'auto', prompt: '--sapiens 验证步态' });
+  assert.deepEqual(parseAgentTrigger(msg('/respond H1 填写'), cfg), { action: 'human', prompt: 'H1 填写' });
   assert.equal(parseAgentTrigger({ ...msg('/human'), fromUserId: 'other' }, cfg).action, 'ignore');
-  assert.equal(parseAgentTrigger(msg('测试'), cfg, { kind: 'auto', sessionId: 's' }).action, 'auto');
+  assert.equal(parseAgentTrigger(msg('测试'), cfg).action, 'talk');
 });
 
 test('notification waits for contact, persists token, retries registration without resending after restart', async t => {
@@ -384,13 +384,13 @@ test('framed submission replay after restart returns the completed receipt', asy
   assert.doesNotMatch(f.replies.at(-1).text, /请先使用/);
 });
 
-test('human API uses the same local runtime root unless explicitly overridden', async () => {
+test('human API uses the same CLI as every other route', async () => {
   let executable;
   const api = createHumanTaskApi({ env: { META_AGENT_RUNTIME_DIR: '/local/runtime' }, run: async bin => {
     executable = bin; return { code: 0, stdout: '{"ok":true,"data":{}}' };
   } });
   await api('human_task.list', {});
-  assert.equal(executable, '/local/runtime/dist/cli-glm.mjs');
+  assert.equal(executable, '/local/runtime/dist/cli.mjs');
 });
 
 test('human reentry chooses a saved task draft by ID instead of inheriting an active selection', async t => {

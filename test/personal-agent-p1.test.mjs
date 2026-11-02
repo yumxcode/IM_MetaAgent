@@ -78,7 +78,7 @@ test('owner upgrade: one historic contact is adopted, several fail closed, * sta
 });
 
 async function parkedTask(f) {
-  f.app.accept(f.msg('/auto')); f.app.accept(f.msg('部署新版本')); await f.app.tick();
+  f.app.accept(f.msg('/auto 部署新版本')); await f.app.tick();
   f.finish(0, { text: '[verify] 待决策' }); await f.app.tick();
   f.runtime.list = [{ target: { workspace: f.app.store.state.tasks.A1.workspace, sessionId: 'session-0' }, status: 'needs-decision', wakeId: 'w1' }];
   f.runtime.inspect = { task: { wake: { reason: '[待决策] 用哪个环境？', checkpoint: { needsHuman: { question: '部署到 staging 还是 prod？' } } } } };
@@ -91,8 +91,7 @@ test('needs-decision tasks are announced once and a quoted reply steers the task
   const notices = outboxTexts(f.app).filter(text => text.startsWith('【待决策 A1】'));
   assert.equal(notices.length, 1); assert.match(notices[0], /staging 还是 prod/);
   assert.equal(f.app.store.state.tasks.A1.status, 'needs-decision');
-  // The owner left /auto earlier; a quoted reply still reaches the task.
-  f.app.accept(f.msg('auto/'));
+  // A quoted reply reaches the task wherever the conversation is.
   f.app.accept(f.msg('部署到 staging', { quoteContext: `[引用: ${notices[0]}]`, quotes: [{ body: notices[0] }] }));
   await f.app.tick();
   const request = f.request(1);
@@ -104,13 +103,12 @@ test('needs-decision tasks are announced once and a quoted reply steers the task
   assert.equal(outboxTexts(f.app).filter(text => text.startsWith('【待决策 A1】')).length, 2);
 });
 
-test('explicit decision command works outside modes; human mode keeps form answers', async t => {
+test('the explicit decision command works anywhere and unknown tasks are refused', async t => {
   const f = fixture(t);
   await parkedTask(f); await f.app.checkDecisions();
   assert.deepEqual(parseDecisionMessage({ commandText: '决定 a1 用 prod' }), { taskId: 'A1', prompt: '用 prod' });
-  assert.equal(parseDecisionMessage({ commandText: '决定 A1 用 prod' }, { kind: 'human' }), null);
-  assert.equal(parseDecisionMessage({ commandText: '/talk', quoteContext: '【待决策 A1】' }), null);
-  f.app.accept(f.msg('auto/')); f.app.accept(f.msg('决定 A1 用 prod')); await f.app.tick();
+  assert.equal(parseDecisionMessage({ commandText: '', quoteContext: '【待决策 A1】' }), null);
+  f.app.accept(f.msg('决定 A1 用 prod')); await f.app.tick();
   assert.equal(f.request(1).prompt, '用 prod');
   f.app.accept(f.msg('决定 A9 任意')); await f.app.flushOutbox();
   assert.ok(f.sent.some(s => /没有找到你的任务 A9/.test(s.text)));
@@ -118,7 +116,7 @@ test('explicit decision command works outside modes; human mode keeps form answe
 
 test('reminders proposed by chat are confirmed, fire durably and can be cancelled', async t => {
   const f = fixture(t);
-  f.app.accept(f.msg('/talk')); f.app.accept(f.msg('一小时后提醒我喝水，每天早上8点提醒我看日报')); await f.app.tick();
+  f.app.accept(f.msg('一小时后提醒我喝水，每天早上8点提醒我看日报')); await f.app.tick();
   const job = f.request(0); assert.deepEqual(job.schedules, []);
   f.finish(0, { text: '好的', scheduleOps: [
     { type: 'create', kind: 'remind', text: '喝水', at: f.time + 60 * 60 * 1000, nextAt: f.time + 60 * 60 * 1000 },
@@ -128,39 +126,42 @@ test('reminders proposed by chat are confirmed, fire durably and can be cancelle
   const confirmation = outboxTexts(f.app).find(text => text.startsWith('好的'));
   assert.match(confirmation, /已创建 R1 · 提醒/); assert.match(confirmation, /已创建 R2 · 提醒 · 每天 08:00/); assert.match(confirmation, /提醒未生效/);
   f.advance(60 * 60 * 1000); await f.app.tick();
-  const fired = Object.values(f.app.store.state.outbox).find(o => o.text.startsWith('⏰ 提醒（R1）'));
+  const fired = Object.values(f.app.store.state.outbox).find(o => o.text.startsWith('【R1·提醒】喝水'));
   assert.ok(fired); assert.equal(fired.fallbackAlert, true);
   assert.equal(f.app.store.state.schedules.R1.enabled, false);
   await f.restart(); await f.app.tick();
-  assert.equal(Object.values(f.app.store.state.outbox).filter(o => o.text.startsWith('⏰ 提醒（R1）')).length, 1);
+  assert.equal(Object.values(f.app.store.state.outbox).filter(o => o.text.startsWith('【R1·提醒】喝水')).length, 1);
+  assert.ok(f.app.store.state.notices[identityOf(f.msg(''))].some(n => n.refId === 'R1'), 'the fired reminder is remembered for the assistant');
   // Local commands in /tasks.
-  f.app.accept(f.msg('talk/')); f.app.accept(f.msg('/tasks')); f.app.accept(f.msg('提醒')); await f.app.tick();
+  f.app.accept(f.msg('/tasks 提醒')); await f.app.tick();
   assert.ok(outboxTexts(f.app).some(text => /^R2 · 提醒 · 每天 08:00/.test(text)));
-  f.app.accept(f.msg('cancel R2')); await f.app.tick();
+  f.app.accept(f.msg('/tasks cancel R2')); await f.app.tick();
   assert.equal(f.app.store.state.schedules.R2.enabled, false);
 });
 
-test('recurring scheduled prompts run as chat turns; missed recurring slots are skipped', async t => {
-  const f = fixture(t);
+test('scheduled prompts are handed to runtime and receipts are delivered exactly once locally', async t => {
+  const f = fixture(t); const submitted = [], cancelled = [];
+  const receipts = [{ id: 'run-1', status: 'succeeded', text: '今日要闻', completedAt: f.time }];
+  f.app.adapter.schedules = async () => ({ submit(spec) { submitted.push(spec); }, cancel(id) { cancelled.push(id); }, receipts() { return receipts; }, ensureWorker() {} });
   f.app.store.update(state => {
-    state.schedules.R1 = { id: 'R1', owner: identityOf(f.msg('')), origin: { accountId: 'b', fromUserId: 'u' }, kind: 'talk', text: '搜索今天的科技新闻并总结', cron: '*/30 * * * *', nextAt: f.time, enabled: true };
+    state.schedules.R1 = { id: 'R1', owner: identityOf(f.msg('')), origin: { accountId: 'b', fromUserId: 'u' }, kind: 'talk', text: '搜索新闻', cron: '*/30 * * * *', nextAt: f.time, enabled: true };
     state.contacts[identityOf(f.msg(''))] = { accountId: 'b', userId: 'u', token: 'token' };
   });
-  await f.app.tick();
-  const job = f.request(0);
-  assert.equal(job.kind, 'talk'); assert.equal(job.scheduleId, 'R1'); assert.equal(job.conversationKey, 'schedule:R1');
-  assert.equal(job.maxTurns, undefined); assert.equal(job.runtime.maxBudgetUsd, undefined);
-  f.finish(0, { text: '今日要闻……' }); await f.app.tick(); await f.app.flushOutbox();
-  assert.ok(f.sent.some(s => s.text.startsWith('⏰ 定时任务 R1\n今日要闻')));
-  const next = f.app.store.state.schedules.R1.nextAt;
-  f.advance(5 * 60 * 60 * 1000); await f.app.tick();
-  assert.equal(f.launches.length, 1, 'a slot missed by hours is not replayed');
-  assert.ok(f.app.store.state.schedules.R1.nextAt > next);
+  await f.app.syncRuntimeSchedules(); await f.app.syncRuntimeSchedules();
+  assert.equal(f.launches.length, 0);
+  assert.equal(submitted.length, 1, 'submit is not repeated every sync');
+  assert.equal(outboxTexts(f.app).filter(text => text.includes('今日要闻')).length, 1);
+  f.app.store.update(state => { state.schedules.R1.enabled = false; });
+  await f.app.syncRuntimeSchedules(); assert.equal(cancelled.length, 1);
+  assert.equal(f.app.store.state.schedules.R1.runtimeCancelled, true);
+  // A cancelled schedule leaves the sync: no client, no cancel, no receipts read.
+  f.app.adapter.schedules = async () => { throw new Error('should not be called'); }; f.app.scheduleClient = null;
+  await f.app.syncRuntimeSchedules(); assert.equal(cancelled.length, 1);
 });
 
 test('declared deliverables are snapshotted and sent as files after the text result', async t => {
   const f = fixture(t);
-  f.app.accept(f.msg('/auto')); f.app.accept(f.msg('生成周报')); await f.app.tick();
+  f.app.accept(f.msg('/auto 生成周报')); await f.app.tick();
   const workspace = f.app.store.state.tasks.A1.workspace;
   fs.mkdirSync(workspace, { recursive: true });
   const report = path.join(workspace, 'report.pdf'), chart = path.join(workspace, 'chart.png'), big = path.join(workspace, 'big.zip');
@@ -177,9 +178,9 @@ test('declared deliverables are snapshotted and sent as files after the text res
 
 test('pruning removes old finished records and their directories but keeps live work', async t => {
   const f = fixture(t, { cfg: { retentionDays: 30 } });
-  f.app.accept(f.msg('/auto')); f.app.accept(f.msg('旧任务')); await f.app.tick();
+  f.app.accept(f.msg('/auto 旧任务')); await f.app.tick();
   f.finish(0); await f.app.tick(); await f.app.flushOutbox();
-  f.app.accept(f.msg('新任务')); await f.app.tick();
+  f.app.accept(f.msg('/auto 新任务')); await f.app.tick();
   const oldExecution = Object.values(f.app.store.state.executions).find(e => e.status === 'succeeded');
   assert.ok(fs.existsSync(f.app.directory(oldExecution.id)));
   f.advance(31 * DAY);
@@ -193,4 +194,15 @@ test('pruning removes old finished records and their directories but keeps live 
   assert.equal(Object.values(state.outbox).filter(o => o.status === 'sent').length, 0);
   assert.equal(state.tasks.A1.goal, '旧任务', 'task records stay');
   assert.ok(state.lastPruneAt);
+});
+
+test('file snapshot integrity is checked before sending and a missing file fails permanently', async t => {
+  const f=fixture(t),file=path.join(f.root,'snapshot.bin');fs.writeFileSync(file,Buffer.from([0xff]));
+  const owner=identityOf(f.msg(''));
+  f.app.store.update(state=>f.app.addFile(state,f.msg(''),{path:file,name:'snapshot.bin'},'integrity'));
+  const entry=Object.values(f.app.store.state.outbox).find(e=>e.owner===owner&&e.kind==='file');
+  fs.writeFileSync(file,Buffer.from([0xfe]));
+  await assert.rejects(()=>f.app.sendEntry(entry,'token'),error=>error.permanent===true);
+  fs.unlinkSync(file);
+  await assert.rejects(()=>f.app.sendEntry(entry,'token'),error=>error.permanent===true);
 });

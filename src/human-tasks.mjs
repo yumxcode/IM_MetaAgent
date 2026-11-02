@@ -10,7 +10,7 @@ const keyOf = (accountId, userId) => JSON.stringify([accountId, userId]);
 const same = (a, b) => a?.accountId === b?.accountId && a?.userId === b?.userId;
 const hash = value => createHash('sha256').update(value).digest('hex').slice(0, 32);
 const ref = taskId => ({ taskId });
-const HELP = '先单独发送 /human 进入人工回填模式，再直接发送：\nhelp：我的待办\nwhoami：查看当前微信身份\nH1：选择工单并恢复草稿（已结束工单仅查看）\nH1 填写：开始回填\nH1 接单、H1 拒绝 原因\n逐项回复字段值，最后发送 提交；退出填写 保留草稿。\n单独发送 human/ 退出人工回填模式。';
+const HELP = '工单命令（也可以直接告诉助理）：\n/pending：我的待办\n/respond whoami：查看当前微信身份\n/respond H1：查看工单并恢复草稿（已结束工单仅查看）\n/respond H1 填写：开始回填\n/respond H1 接单、/respond H1 拒绝 原因\n填写中逐项直接回复字段值，最后发送 提交；“退出填写”保留草稿并退出。';
 
 function completionMatches(task, input) {
   const receipt = task.receipt, by = receipt?.completedBy;
@@ -25,6 +25,11 @@ function readState(file, fallback) {
 }
 
 /** A personal inbox for every project, using the selected bot unless overridden. */
+/** True when an iLink payload carries a newly uploaded attachment (not quoted cached media). */
+export function hasFreshMedia(raw) {
+  return Boolean(raw?.item_list?.some(item => [2, 3, 4, 5].includes(item.type) &&
+    [item.image_item, item.video_item, item.file_item, item.voice_item].some(value => value?.media?.encrypt_query_param || value?.media?.full_url)));
+}
 export function loadHumanDefaultRecipient(env = process.env, defaultAccountId) {
   const userId = env.META_AGENT_HUMAN_DEFAULT_USER_ID?.trim();
   const configuredAccount = env.META_AGENT_HUMAN_DEFAULT_ACCOUNT_ID?.trim();
@@ -66,7 +71,7 @@ export function renderHumanTask(task, alias) {
     `有效至：${new Date(task.deadlineAt).toLocaleString('zh-CN', { hour12: false })} · 等待方式：${task.waitMode}`,
     task.waitMode === 'fallback' && `备用路径：${task.fallbackPlan || ''}（等待超时不等于工单过期）`,
     task.onComplete && `收到回执后：${task.onComplete}`,
-    `请先退出当前模式（如有），再单独发送 /human。\n进入人工回填模式后发送：${alias} 接单、${alias} 填写、${alias} 拒绝 <原因>。`,
+    `回复：/respond ${alias} 接单、/respond ${alias} 填写、/respond ${alias} 拒绝 <原因>；也可以直接告诉助理。`,
   ].filter(Boolean).join('\n');
 }
 
@@ -262,7 +267,7 @@ export function createHumanTasks({ bot, stateDir, routes = [], defaultRecipient 
       }
       if (!command && (!state.active[userKey] || /^\/(tasks|p|goal|sapiens|clear)(?:\s|$)/i.test(raw))) return false;
       const reply = async text => {
-        text += '\n人工回填模式中直接回复内容或发送附件；单独发送 human/ 退出模式。';
+        if (state.active[userKey]) text += '\n填写中直接回复内容或发送附件；回复“退出填写”保留草稿并退出。';
         for (const part of text.match(/[\s\S]{1,1800}/g) || ['']) await bot.reply(msg, part);
       };
       try {
@@ -322,8 +327,7 @@ export function createHumanTasks({ bot, stateDir, routes = [], defaultRecipient 
             if (raw === '跳过' && !field.required) { /* Explicitly omit optional output. */ }
             else if (field.type === 'file') {
               // Only a newly received attachment, never quoted cached media or a typed local path.
-              if (!msg.mediaPath || !msg.raw?.item_list?.some(item => [2, 3, 4, 5].includes(item.type) &&
-                  [item.image_item, item.video_item, item.file_item, item.voice_item].some(value => value?.media?.encrypt_query_param || value?.media?.full_url))) throw new Error('请发送本字段的附件，不能用本地路径或引用消息代替');
+              if (!msg.mediaPath || !(msg.freshMedia ?? hasFreshMedia(msg.raw))) throw new Error('请发送本字段的附件，不能用本地路径或引用消息代替');
               const ext = path.extname(msg.fileName || msg.mediaPath).toLowerCase();
               if (field.accept?.length && !field.accept.map(s => s.toLowerCase()).includes(ext)) throw new Error(`文件格式必须为 ${field.accept.join(' / ')}`);
               fs.mkdirSync(inbox, { recursive: true, mode: 0o700 });
@@ -380,6 +384,8 @@ export function createHumanTasks({ bot, stateDir, routes = [], defaultRecipient 
       return handle({ ...msg, commandText: command ? `/human ${body}` : value === '附件' && msg.mediaPath ? '' : value,
         text: command ? `/human ${body}` : value });
     },
+    /** A form is open for this sender: their next messages are field values, not chat. */
+    isFilling(msg) { return !msg.groupId && allowed(msg.fromUserId) && Boolean(state.active[keyOf(msg.accountId, msg.fromUserId)]); },
     rememberOrigin(workspace, sessionId, msg) {
       if (!sessionId || msg.groupId) return;
       const id = JSON.stringify([workspace, sessionId]);

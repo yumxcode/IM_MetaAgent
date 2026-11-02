@@ -4,6 +4,7 @@ import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { resolveMetaAgentHome, resolveRuntimeCli } from './runtime-cli.mjs';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -72,7 +73,7 @@ async function resolveExecutable(command, env) {
       // Try the next PATH entry.
     }
   }
-  throw new Error(`无法找到 ${command}。请安装 meta-agent runtime >= 0.11.3，或设置 META_AGENT_TASKS_BIN。`);
+  throw new Error(`无法找到 ${command}。请安装 meta-agent runtime >= 0.11.3，或在 .env 设置 META_AGENT_RUNTIME_DIR / META_AGENT_BIN。`);
 }
 
 function supportsRuntimeVersion(version) {
@@ -86,7 +87,8 @@ function supportsRuntimeVersion(version) {
 }
 
 /** Locate the installed package behind an npm bin symlink, or an explicit root. */
-export async function discoverTaskRuntime({ bin = 'meta-agent-glm', runtimeDir, env = process.env } = {}) {
+export async function discoverTaskRuntime({ bin, runtimeDir, env = process.env } = {}) {
+  bin ??= resolveRuntimeCli(env).bin;
   const entryPath = await resolveExecutable(bin, env);
   let root = runtimeDir ? resolve(runtimeDir) : dirname(entryPath);
   if (runtimeDir && root.endsWith('/dist')) root = dirname(root);
@@ -105,7 +107,7 @@ export async function discoverTaskRuntime({ bin = 'meta-agent-glm', runtimeDir, 
     root = dirname(root);
   }
   if (!manifest) {
-    throw new Error('无法定位 @meta-agent/runtime。请将 META_AGENT_TASKS_RUNTIME_DIR 设为已安装包的根目录。');
+    throw new Error('无法定位 @meta-agent/runtime。请将 META_AGENT_RUNTIME_DIR 设为已安装包的根目录。');
   }
   if (!supportsRuntimeVersion(manifest.version)) {
     throw new Error(`任务运维控制台需要 meta-agent runtime >= 0.11.3（tasks --agentic），当前为 ${manifest.version ?? '未知版本'}。`);
@@ -132,14 +134,9 @@ export async function loadOpsRuntime(runtimeDir) {
   return loaded;
 }
 
-/** Resolve ~/.meta-agent (or META_AGENT_HOME) exactly like the runtime. */
-export function resolveMetaAgentHome(env = process.env) {
-  return resolve(env.META_AGENT_HOME?.trim() || join(homedir(), '.meta-agent'));
-}
-
-/** Resolve the tasks console profile/model config path exactly like meta-agent-glm. */
+/** One resolution for every route; kept as named exports for existing callers. */
+export { resolveMetaAgentHome };
+/** Model config for the tasks console: the same file every other route uses. */
 export function resolveTasksProfile(env = process.env, opts = {}) {
-  const home = resolveMetaAgentHome(env);
-  const raw = opts.profile ?? (env.META_AGENT_TASKS_PROFILE?.trim() || env.META_AGENT_CONFIG_FILE?.trim() || join(home, 'glm_config.json'));
-  return resolve(raw);
+  return resolve(opts.profile ?? resolveRuntimeCli(env).profile);
 }
