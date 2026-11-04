@@ -59,9 +59,72 @@ function slimResult(result, max) {
   return { ...rest, ...(typeof rest.text === 'string' ? { text: clip(rest.text, max) } : {}),
     ...(Array.isArray(rest.errors) ? { errors: rest.errors.slice(0, 5).map(e => clip(e, 500)) } : {}) };
 }
-const chunks = text => String(text || '（没有文本结果）').match(/[\s\S]{1,2600}/gu) || [''];
+const CHUNK_MAX = 2600;
+/**
+ * Split a reply into WeChat-sized parts. Cuts prefer a blank line, then a line
+ * break, then the end of a sentence, then a space, within the last 40% of the
+ * window, so a part never ends mid-word or mid-path unless a single line is
+ * longer than the window. Multi-part replies end each part with （i/n）.
+ * Counts code points, so a surrogate pair is never split.
+ */
+export function chunks(text, max = CHUNK_MAX) {
+  const all = Array.from(String(text || '（没有文本结果）'));
+  if (all.length <= max) return [all.join('')];
+  const room = max - 8; // space for "\n（12/34）"
+  const parts = [];
+  let rest = all;
+  while (rest.length > room) {
+    const window = rest.slice(0, room).join(''), floor = Math.floor(window.length * 0.6);
+    let cut = -1;
+    for (const find of [w => w.lastIndexOf('\n\n'), w => w.lastIndexOf('\n'),
+      w => Math.max(...['。', '！', '？', '；', '. ', '! ', '? '].map(p => { const i = w.lastIndexOf(p); return i < 0 ? -1 : i + p.length - 1; })),
+      w => w.lastIndexOf(' ')]) {
+      const i = find(window);
+      if (i >= floor) { cut = i + 1; break; }
+    }
+    // Index into the string is a UTF-16 offset; convert back to code points.
+    const take = cut > 0 ? Array.from(window.slice(0, cut)).length : room;
+    const part = rest.slice(0, take).join('').replace(/\s+$/u, '');
+    if (part) parts.push(part);
+    rest = rest.slice(take);
+    while (rest.length && /\s/u.test(rest[0])) rest = rest.slice(1);
+  }
+  if (rest.length) parts.push(rest.join(''));
+  return parts.length > 1 ? parts.map((part, i) => `${part}\n（${i + 1}/${parts.length}）`) : parts;
+}
 const DAY = 24 * 60 * 60 * 1000;
+/** First non-empty line of a task goal, short enough for a notice header. */
+export const goalTitle = (goal, max = 80) => clip(String(goal || '').split('\n').map(l => l.trim()).find(Boolean) || '', max);
+/**
+ * 【A·状态】 for a task the runtime finished on its own (no IM execution reported it).
+ * Names the task by its goal's first line, never the whole goal: the goal is the
+ * brief written for the agent and can run to thousands of characters.
+ */
+export function statusNotice(task, status, view = {}) {
+  const head = status === 'finished' ? '任务已在后台结束' : '任务在后台执行失败';
+  const lines = [`【${task.id}·状态】${head}（runtime：${status}）`];
+  const title = goalTitle(task.goal);
+  if (title) lines.push(`任务：${title}`);
+  if (status === 'failed' && view?.stopReason) lines.push(`原因：${clip(view.stopReason, 200)}`);
+  if (view?.note) lines.push(`说明：${clip(view.note, 600)}`);
+  lines.push(`详情：/tasks inspect ${task.id}`);
+  return lines.join('\n');
+}
 const DECISION_MARK = /【待决策\s*(A\d+)】/;
+const PARK_TEXT = /^Auto session parked for (\d+)ms:\s*/;
+const spanText = ms => ms >= 3600000 ? `${Math.round(ms / 360000) / 10} 小时` : ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.max(1, Math.round(ms / 1000))} 秒`;
+/** First line of an 【A·结果】: how this IM run ended, in words (a park says when it resumes). */
+export function resultHead(result) {
+  if (result?.subtype === 'parked') {
+    const ms = Number(PARK_TEXT.exec(result.text || '')?.[1]);
+    return `本次执行已挂起，${ms > 0 ? `约 ${spanText(ms)}后` : '到时'}由 runtime 自动继续`;
+  }
+  return `本次执行${result?.ok ? '已返回' : '未完成'}`;
+}
+/** Body of an 【A·结果】: a park's raw "Auto session parked for Nms:" prefix is dropped (resultHead says it). */
+export const resultBody = result => result?.subtype === 'parked' ? String(result.text || '').replace(PARK_TEXT, '') : result?.text;
+/** Tool results tell the assistant IM already shows the handed-over text, so its reply need not repeat it. */
+const ECHO_HINT = '（IM 会在你这条回复末尾附上交给任务的原文和送达情况，回复里不必复述原文。）';
 /** Tags IM puts at the head of messages it originates: 【A3·结果】, 【R2·提醒】, 【P1·确认】, 【待决策 A1】. */
 export const REF_TAG = /【\s*(?:待决策\s*)?([APR]\d+)(?:\s*·[^】]{0,12})?\s*】/i;
 const originOf = msg => ({ accountId: msg.accountId, fromUserId: msg.fromUserId, ...(msg.groupId ? { groupId: msg.groupId } : {}) });
@@ -466,16 +529,74 @@ export class PersonalAgent {
     if (!task.sessionId) throw new Error(`${id} 尚未取得 runtime 会话编号，不能补充`);
     this.checkWorkspace(task.workspace);
     this.runTask(state, this.syntheticItem(state, ctx, 'steer'), task, { intent: 'steer', prompt: text });
-    this.addReply(state, ctx.msg, `【${id}·补充】已交给 ${id}：${text.slice(0, 300)}`, `${ctx.key}:steer`, { ref: { kind: 'task', refId: id } });
-    return `已把补充要求交给 ${id}，任务继续执行。`;
+    this.noteTurn(ctx.executionId, [`↪ 已交给 ${id}（补充）：${clip(text, 300)}`]);
+    return `已把补充要求交给 ${id}，任务继续执行；结果会以【${id}·结果】另行通知。${ECHO_HINT}`;
   }
   decideTask(state, ctx, id, answer) {
     const task = this.ownedTask(state, ctx.owner, id);
     if (!answer) throw new Error('决定内容为空');
     if (!task.decision || task.decision.answeredAt) throw new Error(`${id} 当前没有待决策的问题`);
     this.submitDecision(state, this.syntheticItem(state, ctx, 'decide'), task, answer, task.decision.wakeId);
-    this.addReply(state, ctx.msg, `【${id}·决定】已交给 ${id}：${answer.slice(0, 300)}`, `${ctx.key}:decide`, { ref: { kind: 'task', refId: id } });
-    return `已把决定交给 ${id}；是否恢复执行以 runtime 回执为准。`;
+    this.noteTurn(ctx.executionId, [`↪ 已交给 ${id}（决定）：${clip(answer, 300)}`]);
+    return `已把决定交给 ${id}；是否恢复执行以 runtime 回执为准。${ECHO_HINT}`;
+  }
+  /**
+   * Supplement or decision for an existing task. While the runtime owns the task
+   * (running, or a wake pending: parked, 待决策, overdue) it goes through the
+   * runtime — queued with task.steer, the wake run now — so the board shows the
+   * task running and its log shows the text (RuntimeAdapter.handOff). Returns
+   * null when the runtime does not own it; the caller then queues an IM run
+   * that resumes the session itself.
+   */
+  async deliverToTask(request) {
+    if (typeof this.adapter?.handOff !== 'function') return null;
+    // One delivery per task at a time: a second decision arriving while the first
+    // is being handed over must see the first one's outcome (already answered),
+    // not race it into the runtime queue.
+    this.deliveries ??= new Map();
+    const previous = this.deliveries.get(request.id) || Promise.resolve();
+    const current = previous.catch(() => undefined).then(() => this.deliverNow(request));
+    const tail = current.catch(() => undefined);
+    this.deliveries.set(request.id, tail);
+    tail.then(() => { if (this.deliveries.get(request.id) === tail) this.deliveries.delete(request.id); });
+    return current;
+  }
+  async deliverNow({ owner, id, text, kind, expectedWakeId, key }) {
+    let job;
+    this.store.update(state => {
+      const task = this.ownedTask(state, owner, id);
+      if (!text) throw new Error(kind === 'decide' ? '决定内容为空' : '补充内容为空');
+      if (kind === 'decide') {
+        const wakeId = expectedWakeId ?? task.decision?.wakeId;
+        if (!task.decision || task.decision.answeredAt || !wakeId || task.decision.wakeId !== wakeId) throw new Error(`${id} 当前没有可回复的待决策问题，请重新查询。`);
+        expectedWakeId = wakeId;
+      }
+      if (ACTIVE.has(task.status)) throw new Error(`${id} 正在执行或排队，等这一轮结束后再${kind === 'decide' ? '回复决定' : '补充'}`);
+      if (task.workspaceRemoved) throw new Error(`${id} 的工作目录已按保留策略清理，不能继续；请新建任务。`);
+      if (!task.sessionId) throw new Error(`${id} 尚未取得 runtime 会话编号，不能${kind === 'decide' ? '交付决定' : '补充'}`);
+      this.checkWorkspace(task.workspace);
+      job = { id: digest(`${key}:${kind}`).slice(0, 24), kind: 'auto', intent: 'steer', prompt: text, workspace: task.workspace,
+        resumeSessionId: task.sessionId, runtime: { ...task.runtime, ...this.runtimeLimits('auto') },
+        ...(kind === 'decide' ? { expectedWakeId } : {}), timeZone: this.timeZoneOf?.(owner) };
+    });
+    const out = await this.adapter.handOff(job);
+    if (!out || this.stopped) return out;
+    this.store.update(state => {
+      const task = state.tasks[id];
+      if (kind === 'decide' && task.decision?.wakeId === expectedWakeId) task.decision.answeredAt = this.now();
+      task.status = 'handed_off'; task.lastActivityAt = this.now();
+      task.handoff = { kind, at: this.now(), ...out.handoff };
+    });
+    // Pick up the runtime's new state (running) soon.
+    this.nextTaskSync = Math.min(this.nextTaskSync, this.now() + 3000);
+    return out;
+  }
+  /** task_steer / task_decide: hand off when the runtime owns the task, otherwise an IM run. */
+  async deliverTool(ctx, id, text, kind) {
+    const out = await this.deliverToTask({ owner: ctx.owner, id, text, kind, key: ctx.key });
+    if (!out) return this.runTool(ctx, state => kind === 'decide' ? this.decideTask(state, ctx, id, text) : this.steerTask(state, ctx, id, text));
+    this.noteTurn(ctx.executionId, [`↪ 已交给 ${id}（${kind === 'decide' ? '决定' : '补充'}）：${clip(text, 300)}`, `　${out.text}`]);
+    return `${out.text}${ECHO_HINT}`;
   }
   taskSummary(owner, id) {
     const state = this.store.state;
@@ -728,6 +849,7 @@ export class PersonalAgent {
       const item = this.store.state.inbox[inboxId];
       if (item?.status !== 'queued') continue;
       if (item.route.action === 'decision' && ACTIVE.has(this.store.state.tasks[item.route.taskId]?.status)) continue;
+      if (item.route.action === 'decision' && !item.route.viaIm && typeof this.adapter?.handOff === 'function') { this.deliverDecisionMessage(item); continue; }
       try {
         if (item.route.action !== 'human') { this.routeExecution(item); continue; }
         if (item.route.prompt === 'help') {
@@ -757,6 +879,34 @@ export class PersonalAgent {
         this.store.update(state => { state.inbox[item.id].status = 'done'; this.addReply(state, item.msg, `未执行：${error.message}`, `${item.id}:error`); });
       }
     }
+  }
+  /**
+   * `决定 A1 …` or a reply quoting 【待决策 A1】: hand the decision to the runtime
+   * and answer with one message saying whether the task is running again. A
+   * task the runtime does not own falls back to an IM run (route.viaIm).
+   */
+  deliverDecisionMessage(item) {
+    // Not in this.processing: close() must not wait on a runtime call. A delivery
+    // cut short by a restart is re-queued at startup ('processing' → 'queued') and
+    // replayed with the same request identity, which the runtime recognises.
+    this.decisionJobs ??= new Set();
+    if (this.decisionJobs.has(item.id)) return;
+    this.decisionJobs.add(item.id);
+    this.store.update(state => { state.inbox[item.id].status = 'processing'; });
+    const { taskId, prompt, expectedWakeId } = item.route;
+    setImmediate(() => void this.deliverToTask({ owner: item.owner, id: taskId, text: prompt, kind: 'decide', expectedWakeId, key: item.id })
+      .then(out => this.stopped || this.store.update(state => {
+        const inbox = state.inbox[item.id];
+        if (!out) { inbox.status = 'queued'; inbox.route = { ...inbox.route, viaIm: true }; return; }
+        inbox.status = 'done';
+        this.addReply(state, item.msg, `【${taskId}·决定】${out.text}`, `${item.id}:decision`, { ref: { kind: 'task', refId: taskId } });
+      }))
+      .catch(error => this.stopped || this.store.update(state => {
+        state.inbox[item.id].status = 'done';
+        this.addReply(state, item.msg, `未交付决定：${error.message}`, `${item.id}:decision-error`);
+      }))
+      .catch(error => this.log.error?.(`决定交付记录失败：${error.message}`))
+      .finally(() => { this.decisionJobs.delete(item.id); this.kickSend?.(); }));
   }
   /** Snapshot reported deliverables into the bot's own directory, within count/size limits. */
   prepareDeliverables(execution, result) {
@@ -790,10 +940,16 @@ export class PersonalAgent {
         e.timing = { queueMs: (e.dispatchedAt || e.completedAt) - e.createdAt, ...(result.timing || {}), totalMs: e.completedAt - e.createdAt };
         this.log.info?.(`聊天 ${e.id.slice(0, 12)}：${e.transport === 'serve' ? '常驻' : '单次'}，排队 ${e.timing.queueMs}ms，首个事件 ${e.timing.firstEventMs ?? '-'}ms，总计 ${e.timing.totalMs}ms，${result.subtype || ''}`);
       }
+      const handedOff = result.subtype === 'handed_off';
       if (e.taskId) {
-        const task = state.tasks[e.taskId]; task.status = e.status; task.result = slimResult(result, 4000);
+        const task = state.tasks[e.taskId]; task.status = handedOff ? 'handed_off' : e.status; task.result = slimResult(result, 4000);
         task.requestStatus = e.status; // Transport outcome; runtimeState is execution authority.
         task.lastActivityAt = e.completedAt;
+        // The 【A·结果】 below already tells the user how this run ended; syncTasks
+        // will not repeat it as a separate 【A·状态】 notice. A hand-off ran nothing
+        // here: the runtime's turn is still to come and syncTasks reports its end.
+        if (handedOff) task.handoff = { kind: e.expectedWakeId ? 'decide' : e.intent, at: e.completedAt, ...result.handoff };
+        else task.resultNotifiedAt = e.completedAt;
         if (result.sessionId) task.sessionId = result.sessionId;
         if (result.recoveryValidated) for (const priorId of [...this.index.unknownExec]) {
           const prior = state.executions[priorId];
@@ -806,13 +962,23 @@ export class PersonalAgent {
         if (conversation?.id === e.conversationId) conversation.sessionId = result.sessionId;
       }
       const item = state.inbox[e.inboxId];
-      const prefix = e.taskId ? `【${e.taskId}·结果】本次执行${result.ok ? '已返回' : '未完成'}\n` : e.scheduleId ? `【${e.scheduleId}·定时】\n` : '';
+      if (handedOff && e.taskId) {
+        // One line, labelled by what was handed over; nothing for a request the assistant
+        // made in a chat turn (its reply already carries the hand-over).
+        if (item.route?.action !== 'tool') {
+          const label = e.expectedWakeId ? '决定' : e.intent === 'steer' ? '补充' : '继续';
+          this.addReply(state, item.msg, `【${e.taskId}·${label}】${result.text}`, `${e.id}:result`, { ref: { kind: 'task', refId: e.taskId } });
+        }
+        slimExecution(e);
+        return;
+      }
+      const prefix = e.taskId ? `【${e.taskId}·结果】${resultHead(result)}\n` : e.scheduleId ? `【${e.scheduleId}·定时】\n` : '';
       const extra = [...notes];
       if (result.scheduleOps?.length) extra.push(...this.applyScheduleOps(state, e.owner, originOf(item.msg), result.scheduleOps));
       if (files.send.length) extra.push(`📎 交付文件 ${files.send.length} 个，随后发送：${files.send.map(f => f.name).join('、')}`);
       if (files.skipped.length) extra.push(`未通过微信发送的文件（数量或大小超限）：\n${files.skipped.slice(0, 10).join('\n')}`);
       const refId = e.taskId || e.scheduleId;
-      this.addReply(state, item.msg, prefix + (result.text || result.errors?.join('\n') || `执行结果：${describeRunSubtype(result.subtype)}`) +
+      this.addReply(state, item.msg, prefix + (resultBody(result) || result.errors?.join('\n') || `执行结果：${describeRunSubtype(result.subtype)}`) +
         (!result.ok && result.text ? `\n状态：${describeRunSubtype(result.subtype)}` : '') + (extra.length ? `\n\n${extra.join('\n')}` : ''), `${e.id}:result`,
         refId ? { ref: { kind: e.taskId ? 'task_result' : 'schedule', refId }, notice: true } : {});
       files.send.forEach((file, index) => this.addFile(state, item.msg, file, `${e.id}:file:${index}`));
@@ -1212,9 +1378,14 @@ export class PersonalAgent {
           const previous = current.runtimeState?.status;
           if (statusEnabled && previous !== status) {
             current.runtimeState = { status, changedAt: at };
-            if (previous && ['finished', 'failed'].includes(status)) {
+            if (!TERMINAL.has(status)) current.runtimeActiveAt = at;
+            // Only an ending the user has not heard about gets a notice: not while an IM
+            // execution for the task is in flight (its 【结果】 is coming), and not when a
+            // 【结果】 was already sent after the runtime last became active.
+            const reported = ACTIVE.has(current.status) || Boolean(current.resultNotifiedAt && current.resultNotifiedAt >= (current.runtimeActiveAt || 0));
+            if (previous && ['finished', 'failed'].includes(status) && !reported) {
               const origin = this.originFor(state, current);
-              if (origin) this.addReply(state, origin, `【${current.id}·状态】执行状态更新：${status}\n${current.goal || ''}`, `runtime-state:${current.id}:${status}:${at}`, { fallbackAlert: true, ref: { kind: 'task', refId: current.id }, notice: true });
+              if (origin) this.addReply(state, origin, statusNotice(current, status, view), `runtime-state:${current.id}:${status}:${at}`, { fallbackAlert: true, ref: { kind: 'task', refId: current.id }, notice: true });
             }
           }
           if (!questions.has(current.id) || ACTIVE.has(current.status)) continue;

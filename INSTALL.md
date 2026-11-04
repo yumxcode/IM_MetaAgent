@@ -1,3 +1,7 @@
+> 1.5.5 升级说明（决定与补充交给 runtime；一问一答）：对 runtime 正在管理的任务（运行中、挂起等待唤醒、待决策），微信里的决定和补充不再由 IM 另起一个 `meta-agent --resume --steer` 进程去跑，而是通过 runtime 的 `task.steer` 排队、`task.run` 让该 wake 立即执行。效果：回复决定后 `meta-agent tasks --manage` 立刻显示为运行，日志里能看到“指示 › 恢复时收到…”；不会再出现看板一直显示 decide、随后变成 park、日志里找不到决定的情况，也不会和定时唤醒同时跑同一个会话。已结束的任务（finished/failed/orphaned）仍由 IM 自己恢复。助理调用补充/决定/取消时不再单独发【A·补充】【A·决定】回显，改为附在助理这条回复末尾；交给 runtime 的那一轮不再另发【A·结果】，后续结局照常由【A·状态】/【待决策】报告。直接发“决定 A1 …”或引用【待决策】回复时，只回一条【A1·决定】说明是否已恢复执行。IM 自己执行的一轮挂起时，【A·结果】写成“本次执行已挂起，约 50 分钟后由 runtime 自动继续”，不再显示原始的 `Auto session parked for …ms`。助理在你只是询问进度时不再擅自给任务补充指令。**需要 meta-agent runtime ≥ 0.14.6**（待决策 wake 回复后立即可被 `tasks --manage` 接管、恢复时把排队的决定作为首条指令并写入日志）；旧 runtime 下决定仍能送达，但要等独立的 auto-scheduler 接手。无配置变化。
+>
+> 1.5.4 升级说明（通知整理）：任务完成时不再重复通知——聊天发起的执行已发过 `【A·结果】` 的，runtime 状态变为 finished/failed 时不再另发 `【A·状态】`；只有 runtime 在后台自行结束的任务才发 `【A·状态】`，且只带任务第一行标题、runtime 说明和 `/tasks inspect` 指引，不再附上完整任务说明。超过单条上限的长消息改为在空行、换行或句末处分段，并在每段末尾标注（1/2）这样的序号。无配置变化，直接替换升级即可。
+>
 > 1.5.3 升级说明（统一 CLI）：auto 工作任务、聊天助理、tasks 运维和人工工单改为统一使用同一个 CLI 和同一份模型配置，由新选项 `META_AGENT_CLI` 选择：`meta-agent`（默认，读取 `~/.meta-agent/config.json`）或 `meta-agent-glm`（读取 `glm_config.json`）。**以前 tasks 运维和人工工单默认走 `meta-agent-glm`，升级后默认改为 `meta-agent`**；想全部使用 glm 配置，在 `shared/.env` 中加 `META_AGENT_CLI=meta-agent-glm`。`META_AGENT_TASKS_BIN`、`META_AGENT_HUMAN_BIN`、`META_AGENT_TALK_PROFILE`、`META_AGENT_TASKS_PROFILE` 已停用并被忽略；`META_AGENT_TASKS_RUNTIME_DIR` 仍可用，建议改名为 `META_AGENT_RUNTIME_DIR`。升级后运行 `npm run agent:check`，`runtimeCli` 一节显示实际使用的 CLI、可执行文件和配置文件，以及需要清理的旧变量。
 >
 > 1.5.2 升级说明（长任务被误杀修复）：去掉了 auto 任务输出流 4MB 的累计上限。以前长时间运行的 auto 任务会因此被 IM 中途终止，结果显示为 `output_limit`，这与模型输出长度无关。现在只跳过单条超过 8MB 的事件行，不再终止任务。配合 meta-agent ≥ 0.14.2 时，IM 会通过环境变量 `META_AGENT_JSON_EVENTS=lean` 请求精简事件流（省略 thinking 增量和工具入参/结果正文，管道流量约为原来的 1/500）；旧版 runtime 会忽略这个变量，照常工作。如需完整事件流，在 `shared/.env` 中设置 `META_AGENT_JSON_EVENTS=full`。之前因 `output_limit` 中断的任务，改动都还在工作区，升级后直接续跑即可。
@@ -14,7 +18,7 @@
 
 > 1.2.0 升级要求：先构建含 `@meta-agent/runtime/im` 契约 v1 的 runtime。设置 `META_AGENT_RUNTIME_DIR=/absolute/path/to/meta_agent_runtime`，或升级独立安装并确保 CLI 与公开接口来自同一构建。微信先单独发送 `/tasks`、`/human`、`/talk` 或 `/auto` 进入模式，随后直接发内容，单独发送对应 `xxx/` 退出。旧入口不再触发，旧资料保留。详见 [P0 说明](docs/p0-personal-agent.md)。
 
-# IM_MetaAgent 1.5.3 远端安装与更新
+# IM_MetaAgent 1.5.5 远端安装与更新
 
 本发布包只包含 IM_MetaAgent：独立微信接入层、桥接入口、测试、部署脚本及腾讯官方参考代码（插件 2.4.9 / 安装器 2.1.4）。不包含 meta-agent runtime、依赖目录、本机配置、微信凭据、任务数据或日志；安装脚本不会安装或更新 runtime。
 
@@ -34,12 +38,12 @@ Node.js 20.18 及以上可安装并运行独立 IM 接入层。微信收发、�
 
 ## 首次安装
 
-将 `im-metaagent-1.5.3.tar.gz` 和 `im-metaagent-1.5.3.sha256` 上传到服务器同一目录，以运行任务的普通用户执行：
+将 `im-metaagent-1.5.5.tar.gz` 和 `im-metaagent-1.5.5.sha256` 上传到服务器同一目录，以运行任务的普通用户执行：
 
 ```bash
-sha256sum -c im-metaagent-1.5.3.sha256
-tar -xzf im-metaagent-1.5.3.tar.gz
-cd im-metaagent-1.5.3
+sha256sum -c im-metaagent-1.5.5.sha256
+tar -xzf im-metaagent-1.5.5.tar.gz
+cd im-metaagent-1.5.5
 node scripts/install-release.mjs "$HOME/apps/IM_MetaAgent" --no-service
 ```
 
@@ -78,7 +82,7 @@ sudo systemctl status im-metaagent
 本地发布包也可以全局安装；使用包内入口文件启动：
 
 ```bash
-npm install -g ./im-metaagent-1.5.3.tar.gz
+npm install -g ./im-metaagent-1.5.5.tar.gz
 IM_APP="$(npm root -g)/im-metaagent"
 mkdir -p "$HOME/im-metaagent"
 cd "$HOME/im-metaagent"
@@ -97,10 +101,10 @@ node "$IM_APP/weixin-meta-agent.mjs"
 上传新发布包及校验文件，校验、解压后从新解压目录运行同一个安装器，目标目录始终保持一致：
 
 ```bash
-# 以 1.5.3 为例；后续替换成新版本的文件名和目录名
-sha256sum -c im-metaagent-1.5.3.sha256
-tar -xzf im-metaagent-1.5.3.tar.gz
-cd im-metaagent-1.5.3
+# 以 1.5.5 为例；后续替换成新版本的文件名和目录名
+sha256sum -c im-metaagent-1.5.5.sha256
+tar -xzf im-metaagent-1.5.5.tar.gz
+cd im-metaagent-1.5.5
 node scripts/install-release.mjs "$HOME/apps/IM_MetaAgent" --service
 ```
 

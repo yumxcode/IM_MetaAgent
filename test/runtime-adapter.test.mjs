@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { buildMetaAgentArgs, runMetaAgent, metaAgentEnv, describeRunSubtype } from '../src/meta-agent-bridge.mjs';
 import { loadOpsRuntime } from '../src/meta-agent-tasks.mjs';
-import { RuntimeAdapter, readReminderRequests } from '../src/runtime-adapter.mjs';
+import { RuntimeAdapter, readReminderRequests, runtimeOwns } from '../src/runtime-adapter.mjs';
 import { resolveRuntimeCli, RETIRED_CLI_KEYS } from '../src/runtime-cli.mjs';
 import { createHumanTaskApi } from '../src/human-task-api.mjs';
 import { atomicWrite, readState } from '../src/durable-store.mjs';
@@ -186,13 +186,91 @@ test('continuation checks runtime ownership before launching an execution', asyn
   const root = temp(t), effect = path.join(root, 'effect');
   const job = { kind: 'auto', intent: 'continue', mode: 'auto', prompt: '', workspace: root, resumeSessionId: 's' };
   const adapter = new RuntimeAdapter();
-  for (const status of ['running', 'stale-claim', null]) {
+  for (const status of ['stale-claim', null]) {
     const bin = script(root, `if(process.argv[2]==='call')process.stdout.write(JSON.stringify({ok:true,data:{task:{status:${JSON.stringify(status)}}}}));else require('node:fs').writeFileSync(${JSON.stringify(effect)},'bad');`);
-    await assert.rejects(adapter.execute({ ...job, runtime: { bin } }), /核验|运行/);
+    await assert.rejects(adapter.execute({ ...job, runtime: { bin } }), /核验/);
     assert.equal(fs.existsSync(effect), false);
   }
-  const bin = script(root, `if(process.argv[2]==='call')process.stdout.write(JSON.stringify({ok:true,data:{task:{status:'parked'}}}));else process.stdout.write(JSON.stringify({type:'result',isError:false,subtype:'success',result:'resumed'}));`);
+  // A running runtime task is never resumed in a second process.
+  const running = script(root, `if(process.argv[2]==='call')process.stdout.write(JSON.stringify({ok:true,data:{task:{status:'running',wake:{wakeId:'w1'}}}}));else require('node:fs').writeFileSync(${JSON.stringify(effect)},'bad');`);
+  const handed = await adapter.execute({ ...job, runtime: { bin: running } });
+  assert.equal(handed.subtype, 'handed_off'); assert.equal(handed.text, '任务正在 runtime 中运行。'); assert.equal(fs.existsSync(effect), false);
+  // Only a task nothing will resume (finished, failed, orphaned) gets an IM process.
+  const bin = script(root, `if(process.argv[2]==='call')process.stdout.write(JSON.stringify({ok:true,data:{task:{status:'finished'}}}));else process.stdout.write(JSON.stringify({type:'result',isError:false,subtype:'success',result:'resumed'}));`);
   assert.equal((await adapter.execute({ ...job, runtime: { bin } })).text, 'resumed');
+});
+
+/**
+ * A fake runtime CLI for hand-offs: answers task.inspect / task.steer / task.run
+ * from a small state file, logs every call, and records any attempt to resume a
+ * session in its own process (which a hand-off must never do).
+ */
+function handoffRuntime(root, state) {
+  const file = path.join(root, 'runtime-state.json'), log = path.join(root, 'calls.jsonl');
+  fs.writeFileSync(file, JSON.stringify(state));
+  const bin = script(root, `const fs=require('node:fs'),file=${JSON.stringify(file)},log=${JSON.stringify(log)};
+const st=JSON.parse(fs.readFileSync(file,'utf8')),argv=process.argv.slice(2);
+if(argv[0]!=='call'){fs.appendFileSync(log,JSON.stringify({own:argv})+'\\n');process.stdout.write(JSON.stringify({type:'result',isError:false,subtype:'success',result:'own process'})+'\\n');process.exit(0);}
+const cap=argv[1],input=JSON.parse(argv[argv.indexOf('--input')+1]),yes=argv.includes('--yes');
+fs.appendFileSync(log,JSON.stringify({cap,input,yes})+'\\n');
+const out=d=>{process.stdout.write(JSON.stringify({ok:true,data:d}));},fail=(code,message)=>{process.stdout.write(JSON.stringify({ok:false,error:{code,message}}));process.exit(1);};
+if(cap==='task.inspect'){const t=st.task;out({task:t,actions:{run:{allowed:!!t.wake&&['parked','overdue'].includes(t.status),expectedWakeId:t.wake&&t.wake.wakeId}}});}
+else if(cap==='task.steer'){if(st.task.status==='needs-decision'){st.task.status='parked';st.task.wake.fireAt=Date.now();}st.steered=(st.steered||[]).concat(input.text);fs.writeFileSync(file,JSON.stringify(st));out({state:'queued'});}
+else if(cap==='task.run'){if(st.runError)fail(st.runError,'no slot');st.task.status='running';fs.writeFileSync(file,JSON.stringify(st));out({state:'running'});}
+else fail('NOT_FOUND','?');`);
+  return { bin, calls: () => fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)), state: () => JSON.parse(fs.readFileSync(file, 'utf8')) };
+}
+
+test('a decision for a runtime-owned task is queued with task.steer and the wake run by the runtime, never a second process', async t => {
+  const root = temp(t), adapter = new RuntimeAdapter();
+  const rt = handoffRuntime(root, { task: { status: 'needs-decision', wake: { wakeId: 'auto-wake-1', fireAt: Date.now() + 86400000 } } });
+  const job = { id: 'e-42', kind: 'auto', intent: 'steer', mode: 'auto', prompt: '1. 接受0.7m/s 2. 不接受滑行', workspace: root, resumeSessionId: 'sess-1', expectedWakeId: 'auto-wake-1', runtime: { bin: rt.bin } };
+  const result = await adapter.execute(job);
+  assert.equal(result.subtype, 'handed_off'); assert.equal(result.ok, true);
+  assert.equal(result.text, '决定已送达，runtime 已恢复执行（tasks 中显示为运行）。');
+  assert.deepEqual(result.handoff, { from: 'needs-decision', steered: true, state: 'running' });
+  const calls = rt.calls();
+  assert.deepEqual(calls.map(c => c.cap || 'own'), ['task.inspect', 'task.steer', 'task.inspect', 'task.run']);
+  assert.ok(calls.every(c => !c.own), 'no IM-owned resume');
+  const steer = calls[1];
+  assert.equal(steer.yes, true); assert.deepEqual(steer.input.target, { workspace: root, sessionId: 'sess-1' });
+  assert.equal(steer.input.text, '1. 接受0.7m/s 2. 不接受滑行'); assert.equal(steer.input.requestId, 'im-e-42-steer');
+  assert.equal(calls[3].input.expectedWakeId, 'auto-wake-1'); assert.equal(calls[3].yes, true);
+  assert.deepEqual(rt.state().steered, ['1. 接受0.7m/s 2. 不接受滑行']);
+});
+
+test('a stale or changed decision request is refused before anything is queued', async t => {
+  const root = temp(t), adapter = new RuntimeAdapter();
+  const rt = handoffRuntime(root, { task: { status: 'needs-decision', wake: { wakeId: 'auto-wake-2', fireAt: Date.now() + 1e6 } } });
+  await assert.rejects(adapter.execute({ id: 'e1', kind: 'auto', intent: 'steer', prompt: 'x', workspace: root, resumeSessionId: 's', expectedWakeId: 'auto-wake-1', runtime: { bin: rt.bin } }), /过期/);
+  // Only reads: the task view, then the receipt check for a replay of the same request.
+  assert.deepEqual(rt.calls().map(c => c.cap), ['task.inspect', 'operation.inspect']);
+  assert.equal(rt.calls()[1].input.requestId, 'im-e1-steer');
+});
+
+test('without a free slot the decision stays queued; a timer park gets the supplement at its next wake', async t => {
+  const root = temp(t), adapter = new RuntimeAdapter();
+  const busy = handoffRuntime(root, { runError: 'CAPACITY_EXHAUSTED', task: { status: 'needs-decision', wake: { wakeId: 'w', fireAt: Date.now() + 1e9 } } });
+  const queued = await adapter.handOff({ id: 'e2', intent: 'steer', prompt: '用 prod', workspace: root, resumeSessionId: 's', expectedWakeId: 'w', runtime: { bin: busy.bin } });
+  assert.equal(queued.handoff.state, 'queued'); assert.equal(queued.handoff.runError, 'CAPACITY_EXHAUSTED');
+  assert.equal(queued.text, '决定已送达，已排队，runtime 调度器（tasks --manage 或 auto-scheduler）有空位时恢复执行。');
+
+  const root2 = temp(t), fireAt = Date.UTC(2030, 0, 1, 3, 30);
+  const timer = handoffRuntime(root2, { runError: 'CAPACITY_EXHAUSTED', task: { status: 'parked', wake: { wakeId: 'w2', fireAt } } });
+  const later = await adapter.handOff({ id: 'e3', intent: 'steer', prompt: '先核日志', workspace: root2, resumeSessionId: 's', timeZone: 'Asia/Shanghai', runtime: { bin: timer.bin } });
+  assert.equal(later.handoff.state, 'waiting'); assert.equal(later.text, '补充已送达，任务下次唤醒（11:30）时读到。');
+  assert.ok(timer.calls().every(c => !c.own));
+});
+
+test('a long supplement is clipped to what the steer queue accepts; finished tasks are not handed off', async t => {
+  const root = temp(t), adapter = new RuntimeAdapter();
+  const rt = handoffRuntime(root, { task: { status: 'running', wake: { wakeId: 'w' } } });
+  const out = await adapter.handOff({ id: 'e4', intent: 'steer', prompt: '长'.repeat(5000), workspace: root, resumeSessionId: 's', runtime: { bin: rt.bin } });
+  assert.equal(out.text, '补充已送达，任务正在运行，会在下一步读到。');
+  assert.ok(rt.calls()[1].input.text.length <= 4000);
+  assert.equal(runtimeOwns({ status: 'finished' }), false); assert.equal(runtimeOwns({ status: 'parked' }), false, 'no wake, nothing resumes it');
+  assert.equal(runtimeOwns({ status: 'parked', wake: { wakeId: 'w' } }), true);
+  await assert.rejects(adapter.handOff({ id: 'e5', intent: 'new_goal', prompt: '换', workspace: root, resumeSessionId: 's', runtime: { bin: rt.bin } }), /不能直接更换目标/);
 });
 
 test('one runtime root selects the same CLI for every route', () => {

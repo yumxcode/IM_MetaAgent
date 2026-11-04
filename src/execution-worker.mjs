@@ -68,7 +68,8 @@ export async function runWorker(directory, { adapterFactory } = {}) {
     }
   } catch (error) { result = { ok: false, text: '', subtype: controller.signal.aborted ? 'cancelled' : 'worker_error', errors: [error.message] }; }
   finally { clearInterval(timer); process.removeListener('SIGTERM', abort); process.removeListener('SIGINT', abort); }
-  if (['auto', 'talk'].includes(job.kind) && job.workspace) {
+  // A hand-off ran nothing here: files changing in the workspace belong to the runtime's turn.
+  if (['auto', 'talk'].includes(job.kind) && job.workspace && result.subtype !== 'handed_off') {
     // Files are reported, not sent, here: the bot applies size/count limits and owns delivery.
     try {
       if (job.kind === 'talk') declared.push(...outboxFiles(job.workspace, startedAt - 1000));

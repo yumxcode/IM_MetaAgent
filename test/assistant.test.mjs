@@ -209,14 +209,119 @@ test('task tools only touch the owner\'s tasks and IM echoes what they did', asy
   assert.equal(steered.isError, false);
   const steer = Object.values(f.app.store.state.executions).find(e => e.kind === 'auto');
   assert.equal(steer.intent, 'steer'); assert.equal(steer.resumeSessionId, 's1'); assert.equal(steer.prompt, '加一章 FAQ');
-  assert.ok(f.texts().some(text => text === '【A1·补充】已交给 A1：加一章 FAQ'));
+  assert.ok(!f.texts().some(text => /【A1·补充】/.test(text)), 'no separate echo message');
   assert.equal((await f.tool(turn, 'task_steer', { task: 'A1', text: '再加' })).isError, true, 'busy tasks refuse more steering');
   assert.match((await f.tool(turn, 'task_cancel', { task: 'A1' })).content, /已取消 A1 尚未启动的一轮/);
   f.app.store.update(state => { state.tasks.A1.status = 'needs-decision'; state.tasks.A1.decision = { wakeId: 'w9', question: '哪个环境？' }; });
   assert.equal((await f.tool(turn, 'task_decide', { task: 'A1', answer: 'staging' })).isError, false);
   const decision = Object.values(f.app.store.state.executions).filter(e => e.kind === 'auto').at(-1);
   assert.equal(decision.expectedWakeId, 'w9'); assert.equal(decision.prompt, 'staging');
-  await f.answer(turn);
+  await f.answer(turn, { text: '已转交。' });
+  // One message: the assistant's reply carries what IM handed to the task.
+  const reply = f.texts().filter(text => text.startsWith('已转交。'));
+  assert.equal(reply.length, 1);
+  assert.match(reply[0], /↪ 已交给 A1（补充）：加一章 FAQ\n↪ 已交给 A1（决定）：staging/);
+});
+
+/** Fixture whose runtime adapter can hand work to the runtime (RuntimeAdapter.handOff). */
+function handoffFixture(t, handOff) {
+  const f = fixture(t, { cfg: { maxConcurrent: 2 } });
+  const calls = [];
+  f.app.adapter.handOff = async job => { calls.push(job); return handOff(job); };
+  f.app.store.update(state => {
+    state.tasks.A5 = { id: 'A5', owner: f.owner, goal: 'X1 训练\n很长的说明', workspace: f.root, sessionId: 's5', status: 'needs-decision', mode: 'auto', runtime: { bin: 'fake' },
+      decision: { wakeId: 'auto-wake-9', question: '下一步选哪条？', notifiedAt: 1 }, origin: { accountId: 'b', fromUserId: 'u' } };
+  });
+  return { f, calls };
+}
+const handed = (text, handoff = { from: 'needs-decision', steered: true, state: 'running' }) => ({ ok: true, subtype: 'handed_off', sessionId: 's5', text, handoff });
+
+test('a decision through the assistant goes to the runtime: no IM process, one reply carrying the hand-over', async t => {
+  const { f, calls } = handoffFixture(t, () => handed('决定已送达，runtime 已恢复执行（tasks 中显示为运行）。'));
+  const turn = await f.say('1. 接受0.7m/s 2. 不接受滑行');
+  const result = await f.tool(turn, 'task_decide', { task: 'A5', answer: '用户原话：「1. 接受0.7m/s 2. 不接受滑行」' });
+  assert.equal(result.isError, false, result.content);
+  assert.match(result.content, /^决定已送达，runtime 已恢复执行/); assert.match(result.content, /不必复述原文/);
+  assert.equal(calls.length, 1);
+  assert.deepEqual({ intent: calls[0].intent, expectedWakeId: calls[0].expectedWakeId, resumeSessionId: calls[0].resumeSessionId, prompt: calls[0].prompt },
+    { intent: 'steer', expectedWakeId: 'auto-wake-9', resumeSessionId: 's5', prompt: '用户原话：「1. 接受0.7m/s 2. 不接受滑行」' });
+  assert.equal(Object.values(f.app.store.state.executions).filter(e => e.kind === 'auto').length, 0, 'IM does not resume the session itself');
+  const task = f.app.store.state.tasks.A5;
+  assert.equal(task.status, 'handed_off'); assert.ok(task.decision.answeredAt); assert.equal(task.handoff.state, 'running');
+  assert.equal((await f.tool(turn, 'task_decide', { task: 'A5', answer: '再答一次' })).isError, true, 'answered once');
+  await f.answer(turn, { text: '好的，已按你的决定推进。' });
+  const texts = f.texts();
+  assert.equal(texts.length, 1, `exactly one message, got: ${JSON.stringify(texts)}`);
+  assert.match(texts[0], /^好的，已按你的决定推进。\n\n↪ 已交给 A5（决定）：用户原话：「1\. 接受0\.7m\/s 2\. 不接受滑行」\n　决定已送达，runtime 已恢复执行/);
+});
+
+test('a supplement to a parked task: hand-off, and an IM run only when the runtime will not resume it', async t => {
+  let owned = true;
+  const { f, calls } = handoffFixture(t, () => owned ? handed('补充已送达，任务下次唤醒（11:30）时读到。', { from: 'parked', steered: true, state: 'waiting' }) : null);
+  f.app.store.update(state => { Object.assign(state.tasks.A5, { status: 'succeeded', decision: undefined }); });
+  const turn = await f.say('让 A5 先核日志');
+  assert.match((await f.tool(turn, 'task_steer', { task: 'A5', text: '先核日志' })).content, /下次唤醒（11:30）/);
+  assert.equal(Object.values(f.app.store.state.executions).filter(e => e.kind === 'auto').length, 0);
+  owned = false;
+  assert.match((await f.tool(turn, 'task_steer', { task: 'A5', text: '再看一眼' })).content, /任务继续执行/);
+  const run = Object.values(f.app.store.state.executions).filter(e => e.kind === 'auto');
+  assert.equal(run.length, 1); assert.equal(run[0].intent, 'steer'); assert.equal(calls.length, 2);
+  await f.answer(turn, { text: '好' });
+  assert.equal(f.texts().length, 1);
+});
+
+test('a decision sent as a message is handed to the runtime and answered with one line', async t => {
+  const { f, calls } = handoffFixture(t, () => handed('决定已送达，runtime 已恢复执行（tasks 中显示为运行）。'));
+  f.app.accept(f.msg('', { commandText: '用 0.7 m/s', text: '用 0.7 m/s', quoteContext: '【待决策 A5】X1 训练\n请求标识：auto-wake-9\n问题：下一步选哪条？' }));
+  await f.app.tick(); await flush(); await flush(); await flush();
+  assert.equal(calls.length, 1); assert.equal(calls[0].expectedWakeId, 'auto-wake-9'); assert.equal(calls[0].prompt, '用 0.7 m/s');
+  assert.deepEqual(f.texts(), ['【A5·决定】决定已送达，runtime 已恢复执行（tasks 中显示为运行）。']);
+  assert.equal(Object.values(f.app.store.state.executions).filter(e => e.kind === 'auto').length, 0);
+  assert.ok(f.app.store.state.tasks.A5.decision.answeredAt);
+});
+
+test('a decision message for a task the runtime no longer owns falls back to an IM run', async t => {
+  const { f } = handoffFixture(t, () => null);
+  f.app.accept(f.msg('决定 A5 用 prod')); await f.app.tick(); await flush(); await flush(); await f.app.tick();
+  const run = Object.values(f.app.store.state.executions).filter(e => e.kind === 'auto');
+  assert.equal(run.length, 1); assert.equal(run[0].expectedWakeId, 'auto-wake-9'); assert.equal(run[0].prompt, '用 prod');
+  assert.ok(f.texts().some(text => /交付队列/.test(text)));
+});
+
+test('two decisions arriving together: the second waits for the first and is refused, never both handed over', async t => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { f, calls } = handoffFixture(t, async () => { await gate; return handed('决定已送达，runtime 已恢复执行（tasks 中显示为运行）。'); });
+  f.app.accept(f.msg('决定 A5 用 prod')); f.app.accept(f.msg('决定 A5 用 staging'));
+  await f.app.tick(); await flush(); await flush();
+  release(); for (let i = 0; i < 6; i++) await flush();
+  assert.equal(calls.length, 1, 'only the first decision reached the runtime');
+  assert.equal(calls[0].prompt, '用 prod');
+  const texts = f.texts();
+  assert.ok(texts.includes('【A5·决定】决定已送达，runtime 已恢复执行（tasks 中显示为运行）。'));
+  assert.ok(texts.some(text => /^未交付决定：A5 当前没有可回复的待决策问题/.test(text)), JSON.stringify(texts));
+});
+
+test('a decision interrupted by a restart is delivered once after it, without a false "expired"', async t => {
+  let first = true;
+  const { f, calls } = handoffFixture(t, () => first ? new Promise(() => {}) : handed('决定此前已送达，任务由 runtime 继续处理。', { from: 'needs-decision', steered: true, state: 'delivered' }));
+  f.app.accept(f.msg('决定 A5 用 prod')); await f.app.tick(); await flush();
+  assert.equal(calls.length, 1); assert.equal(Object.values(f.app.store.state.inbox).find(i => i.route.action === 'decision').status, 'processing');
+  first = false;
+  const app = await f.restart();
+  app.adapter.handOff = async job => { calls.push(job); return handed('决定此前已送达，任务由 runtime 继续处理。', { from: 'needs-decision', steered: true, state: 'delivered' }); };
+  await app.tick(); for (let i = 0; i < 4; i++) await flush();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].id, calls[0].id, 'same request identity, so the runtime recognises the replay');
+  assert.deepEqual(f.texts(), ['【A5·决定】决定此前已送达，任务由 runtime 继续处理。']);
+  assert.ok(app.store.state.tasks.A5.decision.answeredAt);
+});
+
+test('a refused hand-off is reported, not swallowed', async t => {
+  const { f } = handoffFixture(t, () => { throw new Error('待决策请求已变化或过期，请重新查询后回复'); });
+  f.app.accept(f.msg('决定 A5 用 prod')); await f.app.tick(); await flush(); await flush(); await flush();
+  assert.deepEqual(f.texts(), ['未交付决定：待决策请求已变化或过期，请重新查询后回复']);
+  assert.equal(f.app.store.state.tasks.A5.decision.answeredAt, undefined);
 });
 
 test('reminders created by the assistant use the owner\'s time zone and are confirmed in the reply', async t => {

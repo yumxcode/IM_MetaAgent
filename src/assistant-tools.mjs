@@ -32,10 +32,10 @@ export const ASSISTANT_TOOL_SPECS = [
     }, ['goal']), timeoutMs: 30000 },
   { name: 'task_status', readOnly: true, description: '查询用户的工作任务。不传 task 列出全部任务（编号、状态、目标、目录）；传 task（如 A3）返回详情、最近结果和待决策问题。',
     inputSchema: obj({ task: str('任务编号，如 A3') }) },
-  { name: 'task_steer', description: '给已有的工作任务补充要求并继续执行（任务正在运行时会被拒绝）。IM 会把补充内容回显给用户。',
-    inputSchema: obj({ task: str('任务编号，如 A3'), text: str('补充要求') }, ['task', 'text']) },
-  { name: 'task_decide', description: '把用户对【待决策】问题的回答交给对应任务并继续执行。只有用户明确给出决定时才调用。',
-    inputSchema: obj({ task: str('任务编号，如 A3'), answer: str('用户的决定，尽量保留原话') }, ['task', 'answer']) },
+  { name: 'task_steer', description: '把用户的补充要求交给已有的工作任务（运行中的任务在下一步读到；挂起的任务立即恢复执行）。只在用户要求改变或补充做法时调用；用户只是询问进度时用 task_status 回答，发现需要纠偏就向用户建议，由用户决定。IM 会在你的回复末尾附上交出的原文和送达情况。',
+    inputSchema: obj({ task: str('任务编号，如 A3'), text: str('补充要求') }, ['task', 'text']), timeoutMs: 150000 },
+  { name: 'task_decide', description: '把用户对【待决策】问题的回答交给对应任务，任务随即恢复执行。只有用户明确给出决定时才调用。IM 会在你的回复末尾附上交出的原文和送达情况。',
+    inputSchema: obj({ task: str('任务编号，如 A3'), answer: str('用户的决定，尽量保留原话') }, ['task', 'answer']), timeoutMs: 150000 },
   { name: 'task_cancel', description: '取消工作任务当前排队或正在执行的一轮（任务记录和上下文保留，之后可继续）。只有用户明确要求时才调用。',
     inputSchema: obj({ task: str('任务编号，如 A3') }, ['task']) },
   { name: 'reminder_create', description: '创建提醒或定时任务。只有用户明确要求时才调用；时间不明确先问。at 与 cron 二选一。kind=remind 到点发提醒；kind=talk 到点把 text 作为指令交给助理执行并发送结果。',
@@ -73,8 +73,8 @@ export function createAssistantTools(agent) {
       return ok(`已向用户发送确认消息 ${proposal.id}，等待用户回复“确认”。在用户确认前任务不会开始；不要声称已经开始。`);
     },
     async task_status({ task }, ctx) { return ok(agent.taskSummary(ctx.owner, task ? taskId(task) : null)); },
-    async task_steer({ task, text }, ctx) { return ok(agent.runTool(ctx, state => agent.steerTask(state, ctx, taskId(task), String(text || '').trim()))); },
-    async task_decide({ task, answer }, ctx) { return ok(agent.runTool(ctx, state => agent.decideTask(state, ctx, taskId(task), String(answer || '').trim()))); },
+    async task_steer({ task, text }, ctx) { return ok(await agent.deliverTool(ctx, taskId(task), String(text || '').trim(), 'steer')); },
+    async task_decide({ task, answer }, ctx) { return ok(await agent.deliverTool(ctx, taskId(task), String(answer || '').trim(), 'decide')); },
     async task_cancel({ task }, ctx) { return ok(agent.runTool(ctx, state => agent.cancelTask(state, ctx.owner, taskId(task), ctx.msg, `${ctx.key}:cancel`))); },
     async reminder_create({ text, at, cron, kind = 'remind' }, ctx) {
       const timeZone = agent.timeZoneOf(ctx.owner);
